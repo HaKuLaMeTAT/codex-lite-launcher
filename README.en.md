@@ -4,7 +4,7 @@
 
 Optional performance patches for the Windows Codex desktop app. Reduce hidden-window preloading, batch frequent output and refresh events, and avoid unnecessary background work.
 
-- **Choose your optimizations**: 11 options, all enabled by default and individually selectable.
+- **Choose your optimizations**: 12 options, all enabled by default and individually selectable.
 - **Two deployment modes**: patch an existing installation in place or create a separate optimized copy.
 - **Rollback support**: in-place upgrades retain paired backups and a record of selected options.
 - **Source only**: run locally with Node.js and PowerShell; no npm dependency installation required.
@@ -40,8 +40,8 @@ The launcher currently uses Chinese labels. Their English meanings are included 
 
 1. Confirm the detected Codex installation, or click **选择来源** (Select source).
 2. Choose **原位升级** (In-place upgrade) or **独立副本** (Separate copy), then select the optimizations you want.
-3. Click **检查来源** (Check source). Check again after changing paths or options.
-4. Follow the instructions for your chosen mode below.
+3. Click **原位升级** (In-place upgrade) or **生成副本** (Generate copy) directly. The operation validates the source and current options before making changes.
+4. **检查来源** (Check source) is optional for previewing compatibility and disk requirements. Changing parameters does not require another manual check.
 
 ## Choose a deployment mode
 
@@ -56,15 +56,15 @@ Disk figures come from the currently supported app version. Use the check result
 
 ### In-place upgrade and rollback
 
-After the check passes, fully exit the Codex desktop app and Codex CLI. Keep the patch tool open and click **原位升级** (In-place upgrade). When it finishes, launch Codex as usual.
+After selecting the source and options, fully exit the Codex desktop app and Codex CLI. Keep the patch tool open and click **原位升级** (In-place upgrade). When the tool displays **补丁应用成功** (Patch applied successfully), launch Codex as usual.
 
-The upgrade processes the EXE and ASAR together and saves `.before-lite-v5` backups plus the option record `codex-lite-install.json`. **Keep these files together. Do not replace only the EXE or only the ASAR.**
+The first in-place upgrade processes the EXE and ASAR together and saves one baseline backup pair, suffixed `.before-lite-v5`, plus the option record `codex-lite-install.json`. Within the same Codex app version, later patch upgrades (for example, 0.7.0 → 0.8.0) and option changes reuse this pair. They do not add version-specific backups or overwrite the baseline. Temporary staging space is still required. **Keep these files together. Do not replace only the EXE or only the ASAR.**
 
-To roll back, exit Codex, check the installation again in in-place mode, and click **原位回滚** (In-place rollback). Rollback restores the files from before this upgrade, regardless of the currently selected options. To change the optimization set, roll back first, then select, check, and apply the new set. If replacement fails partway through, keep Codex closed, check again, and roll back.
+To roll back, exit Codex, check the installation again in in-place mode, and click **原位回滚** (In-place rollback). Rollback restores the original baseline backup pair, regardless of the currently selected options; it does not step back through patch versions. To change the optimization set, select and apply it directly, without rolling back first. Existing backups are reused; the tool does not reconstruct an official unmodified installation from them. If replacement fails partway through, keep Codex closed, check again, and roll back.
 
 ### Create and use a separate copy
 
-Choose an output directory that does not exist yet. After the check passes, click **生成副本** (Generate copy). The default destination is `copies/Codex-optimized` under the tool directory. You can keep using the source installation during generation, but do not update it at the same time.
+Choose an output directory that does not exist yet and click **生成副本** (Generate copy). The operation checks the source automatically. The default destination is `copies/Codex-optimized` under the tool directory. You can keep using the source installation during generation, but do not update it at the same time.
 
 Once generation finishes, exit other Codex desktop processes and double-click `启动优化版.cmd` inside the copy. This entry point checks the core files against the manifest. To change the optimization set, generate another copy in a new directory; existing directories are not overwritten. Failed generation retains a `.building` directory for inspection. Do not launch the app from it.
 
@@ -87,6 +87,11 @@ All options are enabled by default. Both modes use the same patch logic. Deselec
 | Merge text nodes after animation | Merges consecutive plain-text fragments after fade-in completes; preserves links, decorations, and fragments still animating |
 | Reuse code-language detection | Reduces repeated automatic detection, with corrections as content changes and after streaming stops; explicit languages remain unchanged, and timer cleanup is enabled with this option |
 | Batch MCP tool-list refreshes | Handles the first ready event immediately and adds one trailing refresh for repeats within 200 ms; failure, authorization, and other handling remain unchanged |
+| Unsubscribe inactive sessions after 5 minutes | Reuses the original release checks and shortens background retention; reopening may require tool recreation |
+
+The new session option reduces the original unsubscribe timeout from 3 hours to 5 minutes, retaining the existing capacity rule of up to 10 inactive sessions. It only affects sessions that pass the original release checks. Running sessions, sessions with active views, and sessions with other subscribers are protected. Deselect it to retain the original policy.
+
+**Unsubscribing does not guarantee immediate tool-process exit.** The backend still controls actual cleanup. The [official SessionEnd documentation](https://learn.chatgpt.com/docs/hooks#sessionend) describes an idle cleanup period of about 30 minutes without connected clients; this is not a measured exit deadline for the installed binary. After cleanup, reopening a session may need to recreate tools, and in-memory state such as REPL variables is not guaranteed to survive. The tool does not forcibly kill processes or delete conversation history. This option does not defer tool startup until its first invocation.
 
 See [options.json](options.json) for option IDs. Selecting none adds no optimizations: in-place mode leaves a clean installation unchanged and creates no backups; copy mode still copies the runtime files.
 
@@ -106,7 +111,7 @@ The following sample was taken during early on-demand loading optimization work 
 
 **These are historical observations, not a controlled benchmark or a performance guarantee.** The before sample lasted about 61 seconds after 11–12 minutes of app uptime; the after sample lasted about 30 seconds after 4–5 minutes of uptime. Sessions, activity, and window states were not controlled, so the full difference cannot be attributed to the patches. CPU is normalized to total machine capacity at 100%; memory figures use private memory.
 
-These figures do not represent every option combination or independently measure the later output, highlighting, and refresh optimizations. The project does not claim to fix long-term memory leaks. Only an anonymized summary is published, not raw personal sampling logs.
+These figures do not represent every option combination or independently measure the later output, highlighting, refresh, and session-unsubscribe optimizations. The project does not claim to fix long-term memory leaks. Only an anonymized summary is published, not raw personal sampling logs.
 
 ## Compatibility and updates
 

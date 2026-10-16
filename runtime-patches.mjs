@@ -99,6 +99,41 @@ function walk(node, visit, ancestors = []) {
 const member = (node, name) => node?.type === 'CallExpression' && node.callee.type === 'MemberExpression' && node.callee.property.name === name;
 const label = node => node?.type === 'Literal' ? node.value : node?.type === 'TemplateLiteral' && node.expressions.length === 0 ? node.quasis[0].value.cooked : null;
 
+// 复用原会话退订流程，只缩短保留期；不改执行中、活跃视图及其他订阅者的保护条件。
+export function transformInactiveThreads(source, kind) {
+  const marker = '/*codex-lite-inactive:v1*/';
+  if (source.includes(marker)) throw new Error('已包含非活跃会话补丁。');
+  const tree = acorn.parse(source, { ecmaVersion: 'latest', sourceType: 'module' });
+  const classes = [], bindings = [];
+  walk(tree, node => {
+    if (!['ClassExpression', 'ClassDeclaration'].includes(node.type)) return;
+    const methods = new Map(node.body.body.filter(n => n.type === 'MethodDefinition').map(n => [n.key.name, n]));
+    const candidates = methods.get('getInactiveOwnerConversationIdsToUnsubscribe');
+    const next = methods.get('getNextCheckAtMs'), unsubscribe = methods.get('unsubscribeInactiveConversation');
+    if (!candidates || !next || !unsubscribe || !methods.has('shouldKeepConversationLoaded')) return;
+    const ttl = [];
+    walk(candidates, n => { if (n.type === 'Property' && n.key.name === 'ttlMs' && n.value.type === 'Identifier') ttl.push(n.value.name); });
+    if (ttl.length !== 1) return;
+    const text = n => source.slice(n.start, n.end);
+    if (![next, candidates].every(n => ['hasActiveConversationView', 'hasOwnedStreamFollowers', 'shouldKeepConversationLoaded', 'ownsConversationHistoryStream'].every(key => text(n).includes(`this.${key}(`) || text(n).includes(`.${key}(`))) ||
+        !text(unsubscribe).includes('thread/unsubscribe') || !text(unsubscribe).includes('needs_resume')) return;
+    let expiry = 0, deadline = 0;
+    walk(candidates, n => { if (n.type === 'BinaryExpression' && n.operator === '>=' && n.right.name === ttl[0] && n.left.type === 'BinaryExpression' && n.left.operator === '-') expiry++; });
+    walk(next, n => { if (n.type === 'BinaryExpression' && n.operator === '+' && n.right.name === ttl[0]) deadline++; });
+    if (expiry === 1 && deadline === 1) classes.push(ttl[0]);
+  });
+  if (classes.length !== 1) throw new Error(`非活跃会话管理器：应唯一匹配，实际匹配 ${classes.length} 处。`);
+  walk(tree, node => {
+    const value = node.type === 'VariableDeclarator' && node.id.name === classes[0] ? node.init :
+      node.type === 'AssignmentExpression' && node.operator === '=' && node.left.name === classes[0] ? node.right : null;
+    if (value?.type === 'Literal' && value.value === 10800000) bindings.push(value);
+  });
+  if (bindings.length !== 1) throw new Error('非活跃会话 3 小时时限：应唯一匹配，当前版本暂不支持。');
+  const value = bindings[0], result = source.slice(0, value.start) + marker + '300000' + source.slice(value.end);
+  acorn.parse(result, { ecmaVersion: 'latest', sourceType: 'module' });
+  return { bytes: Buffer.from(result), edits: [{ name: `inactive-thread-unsubscribe-${kind}`, start: value.start, end: value.end }] };
+}
+
 export function transformRuntime(source, kind, selected) {
   if (source.includes(RUNTIME_MARKER)) throw new Error('已包含运行时优化补丁。');
   const type = kind === 'main' ? 'script' : 'module';

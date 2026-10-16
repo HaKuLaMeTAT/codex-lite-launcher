@@ -29,7 +29,7 @@ function Find-Installation {
 }
 
 $form = New-Object Windows.Forms.Form
-$form.Text = 'Codex 轻启 v0.7.0'
+$form.Text = 'Codex 轻启 v0.8.0'
 $form.ClientSize = New-Object Drawing.Size(720, 750)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
@@ -73,7 +73,7 @@ $form.Controls.Add($outputBrowse)
 # Windows PowerShell 5.1 的 ConvertFrom-Json 将数组作为单个管道对象输出，直接赋值避免再包一层。
 $optionDefinitions = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'options.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $optionLabel = New-Object Windows.Forms.Label
-$optionLabel.Text = '性能优化项（默认全选，修改勾选后需重新检查）'
+$optionLabel.Text = '性能优化项（默认全选，执行时自动检查所选项）'
 $optionLabel.SetBounds(22, 236, 675, 24)
 $form.Controls.Add($optionLabel)
 $optionList = New-Object Windows.Forms.CheckedListBox
@@ -130,11 +130,11 @@ $timer.Interval = 200
 function Reset-Mode {
     $inplace = $modeBox.SelectedIndex -eq 1
     $applyButton.Text = if ($inplace) { '原位升级' } else { '生成副本' }
-    $description.Text = if ($inplace) { '配套替换 EXE/ASAR；先备份升级前版本，保留现有启动方式。' } else { '仅写入新目录，不修改来源安装；支持从已原位升级的安装生成副本。' }
+    $description.Text = if ($inplace) { '配套替换 EXE/ASAR；连续升级复用最初备份，保留现有启动方式。' } else { '仅写入新目录，不修改来源安装；支持从已原位升级的安装生成副本。' }
     $outputPath.Enabled = -not $inplace; $outputBrowse.Enabled = -not $inplace
     $restoreButton.Visible = $inplace; $openButton.Visible = -not $inplace
-    $applyButton.Enabled = $false; $restoreButton.Enabled = $false; $openButton.Enabled = $false
-    $status.Text = '请检查所选安装。'
+    $applyButton.Enabled = -not [string]::IsNullOrWhiteSpace($location.Text); $restoreButton.Enabled = $false; $openButton.Enabled = $false
+    $status.Text = '选择参数后可直接执行，也可先检查来源。'
     $details.Text = if ($inplace) { "检查期间可保持 Codex 运行。`r`n升级/回滚前请完全退出桌面应用和 Codex CLI，保留此工具窗口。`r`n首次升级约需 1 GiB 临时可用空间，完成后保留约 0.51 GiB 配套回滚备份。" } else { "生成期间可继续使用来源安装；不要同时更新它。`r`n副本另占约 2.2 GiB 空间；完成后不会自动启动或切换入口。" }
 }
 
@@ -178,7 +178,7 @@ function Start-Operation([string]$Command) {
         $script:stdoutTask = $script:worker.StandardOutput.ReadToEndAsync()
         $script:stderrTask = $script:worker.StandardError.ReadToEndAsync()
         foreach ($control in @($modeBox, $optionList, $location, $browse, $outputPath, $outputBrowse, $checkButton, $applyButton, $restoreButton, $openButton)) { $control.Enabled = $false }
-        $status.Text = @{ inspect = '正在检查来源…'; create = '正在复制并校验完整应用，请等待…'; apply = '正在备份、校验并原位升级…'; restore = '正在校验并回滚升级前版本…' }[$Command]
+        $status.Text = @{ inspect = '正在检查来源…'; create = '正在检查来源、生成并校验副本…'; apply = '正在检查所选优化并原位升级…'; restore = '正在校验并恢复最初基线备份…' }[$Command]
         $timer.Start()
     } catch {
         $status.Text = '未执行操作'
@@ -212,21 +212,31 @@ $timer.Add_Tick({
             }
             { $_ -in @('upgrade-ready','upgrade-applied','upgrade-restored') } {
                 $restoreButton.Enabled = $result.canRestore
-                $applyButton.Enabled = $result.state -in @('ready','patched') -and -not $result.matchesSelection
+                $applyButton.Enabled = $result.state -in @('ready','patched','upgraded') -and -not $result.matchesSelection
                 $required = [math]::Round($result.requiredFreeBytes / 1GB, 2)
                 $free = [math]::Round($result.freeBytes / 1GB, 2)
                 if ($result.state -eq 'partial') { $status.Text = '检测到半完成替换，请保持 Codex 关闭并原位回滚' }
-                elseif ($result.state -eq 'upgraded') { $status.Text = if ($result.matchesSelection) { '当前安装与所选优化一致，可按原方式启动' } else { '当前已应用另一组选项；请先回滚，再按新选择升级' } }
-                elseif ($result.status -eq 'upgrade-restored') { $status.Text = '已回滚至本次原位升级前的版本' }
+                elseif ($result.status -eq 'upgrade-applied') { $status.Text = '补丁应用成功，已完成文件校验，可按原方式启动 Codex' }
+                elseif ($result.status -eq 'upgrade-restored') { $status.Text = '回滚成功，已恢复最初基线备份' }
+                elseif ($result.state -eq 'upgraded') { $status.Text = if ($result.matchesSelection) { '当前安装与所选优化一致，可按原方式启动' } else { '可直接升级为所选优化，复用最初配套备份' } }
                 elseif ($result.matchesSelection) { $status.Text = '所选优化已满足，无需替换文件' }
                 else { $status.Text = '检查通过，退出 Codex 后可原位升级' }
-                $details.Text = "应用版本：$($result.version)`r`n本次准备约需 $required GiB 可用空间，当前可用 $free GiB。`r`n回滚备份：$($result.backup)`r`nEXE 备份：$($result.exeBackup)`r`n升级和回滚同时处理两个文件；不会自动关闭或启动 Codex。"
+                if ($result.status -eq 'upgrade-applied') {
+                    $details.Text = "应用版本：$($result.version)`r`n结果：安装文件已与所选优化一致，校验通过。`r`n基线 ASAR 备份：$($result.backup)`r`n基线 EXE 备份：$($result.exeBackup)`r`n现在可以按原方式启动 Codex；后续升级继续复用这组备份。"
+                } elseif ($result.status -eq 'upgrade-restored') {
+                    $details.Text = "应用版本：$($result.version)`r`n结果：EXE 和 ASAR 已恢复至基线，校验通过。`r`n基线 ASAR 备份：$($result.backup)`r`n基线 EXE 备份：$($result.exeBackup)`r`n现在可以按原方式启动 Codex。"
+                } else {
+                    $details.Text = "应用版本：$($result.version)`r`n本次准备约需 $required GiB 可用空间，当前可用 $free GiB。`r`n回滚备份：$($result.backup)`r`nEXE 备份：$($result.exeBackup)`r`n升级和回滚同时处理两个文件；不会自动关闭或启动 Codex。"
+                }
             }
             default { throw '工具返回了未知状态，请检查补丁文件是否完整。' }
         }
         $names = @($optionDefinitions | Where-Object { $result.selectedOptions -contains $_.id } | ForEach-Object { $_.label })
         $summary = if ($names.Count) { $names -join '、' } else { '不新增优化' }
-        $details.Text += "`r`n所选优化：$summary"
+        if ($result.status -ne 'upgrade-restored') {
+            $selectionLabel = if ($result.status -in @('upgrade-applied','copy-created')) { '已应用优化' } else { '所选优化' }
+            $details.Text += "`r`n${selectionLabel}：$summary"
+        }
         if ($SmokeTest) {
             [Console]::WriteLine((@{ status = $result.status; itemCount = $optionList.Items.Count; checkedCount = $optionList.CheckedItems.Count; selectedOptions = $result.selectedOptions } | ConvertTo-Json -Compress))
         }
@@ -234,7 +244,8 @@ $timer.Add_Tick({
     } catch {
         $status.Text = '操作未完成'
         if ($SmokeTest) { [Console]::Error.WriteLine($_.Exception.Message) }
-        $details.Text = $_.Exception.Message + "`r`n请处理上述原因后重新检查。若提示访问被拒绝，请确认目录权限。"
+        $details.Text = $_.Exception.Message + "`r`n请处理上述原因后重试。若提示访问被拒绝，请确认目录权限。"
+        $applyButton.Enabled = -not [string]::IsNullOrWhiteSpace($location.Text)
     } finally {
         $script:worker.Dispose()
         $script:worker = $null
@@ -251,10 +262,14 @@ $timer.Add_Tick({
     }
 })
 $optionList.Add_ItemCheck({
-    $applyButton.Enabled = $false; $openButton.Enabled = $false
-    $status.Text = '勾选已改变，请重新检查；回滚始终使用上次安装记录。'
+    param($sender, $eventArgs)
+    # 控件刷新可能发出值未变化的 ItemCheck；操作期间也不能覆盖完成结果。
+    if ($eventArgs.NewValue -eq $eventArgs.CurrentValue -or $null -ne $script:worker) { return }
+    $applyButton.Enabled = -not [string]::IsNullOrWhiteSpace($location.Text); $openButton.Enabled = $false
+    $status.Text = '勾选已更新，可直接执行；执行时自动校验，无需重新检查。'
+    $details.Text = '待执行：按当前勾选应用优化。回滚仍恢复最初基线备份。'
 })
-$location.Add_TextChanged({ $applyButton.Enabled = $false; $restoreButton.Enabled = $false; $openButton.Enabled = $false })
+$location.Add_TextChanged({ $applyButton.Enabled = $null -eq $script:worker -and -not [string]::IsNullOrWhiteSpace($location.Text); $restoreButton.Enabled = $false; $openButton.Enabled = $false })
 $modeBox.Add_SelectedIndexChanged({ Reset-Mode })
 $outputPath.Add_TextChanged({ $openButton.Enabled = $false })
 $browse.Add_Click({

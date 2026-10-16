@@ -57,7 +57,6 @@ export function applyUpgrade(target, requireIdle = requireStopped, selected) {
   requireIdle();
   const plan = resolveUpgrade(target, selected), info = report(plan), items = files(plan);
   if (plan.state !== 'partial' && plan.matchesSelection) return report(plan, 'upgrade-applied');
-  check(plan.state !== 'upgraded', '当前已应用另一组选项，请先原位回滚，再按新选项升级。');
   check(plan.state !== 'partial', '安装处于半完成状态，请先执行原位回滚。');
   check(info.freeBytes >= info.requiredFreeBytes, `磁盘空间不足，至少需要 ${(info.requiredFreeBytes / 1024 ** 3).toFixed(2)} GiB 可用空间。`);
   checkTemporary(items);
@@ -66,14 +65,17 @@ export function applyUpgrade(target, requireIdle = requireStopped, selected) {
     if (!fs.existsSync(item.backup)) fs.copyFileSync(item.target, item.backup, fs.constants.COPYFILE_EXCL);
     check(sha256(fs.readFileSync(item.backup)) === sha256(item.before), `回滚备份校验失败：${item.backup}`);
   }
-  // 在替换核心文件之前保存本次选择，中途失败及下次回滚不依赖界面当前勾选。
-  const selectionText = JSON.stringify({ format: 1, options: plan.candidate.report.selectedOptions, beforeHashes: plan.beforeHashes }, null, 2) + '\n';
+  // 始终复用最初配套备份；升级期间记录上一组选项，不额外复制一份旧补丁安装。
+  const record = { format: 1, options: plan.candidate.report.selectedOptions, beforeHashes: plan.beforeHashes,
+    ...(plan.state === 'upgraded' ? { previousOptions: plan.installedOptions } : {}) };
+  const selectionText = JSON.stringify(record, null, 2) + '\n';
   fs.writeFileSync(plan.selectionFile + '.tmp', selectionText, { flag: 'wx' });
   fs.renameSync(plan.selectionFile + '.tmp', plan.selectionFile);
   plan.selectionText = selectionText;
   stage(items, 'after');
   requireIdle(); currentUnchanged(plan);
   replace(items, 'after');
+  // 上一组选项只是少量恢复元数据，下次升级直接覆盖，不累积文件或历史记录。
   return report({ ...plan, state: 'upgraded', backupsComplete: true, matchesSelection: true, installedOptions: plan.candidate.report.selectedOptions }, 'upgrade-applied');
 }
 export function restoreUpgrade(target, requireIdle = requireStopped) {

@@ -5,13 +5,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { transform, transformCheckout, buildPatch, buildOptimizedPatch, readArchive, sha256, VERSION, BACKUP_SUFFIX, install, restore, inspect, sourceForCopy } from '../patch.mjs';
-import { transformRuntime } from '../runtime-patches.mjs';
+import { transformRuntime, transformInactiveThreads } from '../runtime-patches.mjs';
 import { inspectUpgrade, applyUpgrade, restoreUpgrade } from '../inplace.mjs';
 import { UPGRADE_BACKUP_SUFFIX, rewriteArchive } from '../patch.mjs';
 import { executableIntegrity, headerHash, updateExecutable } from '../exe-integrity.mjs';
 import { createCopy, inspectSource, verifyCopy, hashFile, MANIFEST } from '../copy.mjs';
 import { OPTIONS, normalizeOptions, parseOptionsArgument } from '../options.mjs';
-import { SELECTION_FILE } from '../patch.mjs';
+import { SELECTION_FILE, UNRECORDED_OPTIONS } from '../patch.mjs';
+import acorn from '../vendor/acorn.cjs';
 
 function exeFixture(asar) {
   const exe = Buffer.alloc(0x800);
@@ -121,11 +122,25 @@ test('missing, duplicate and already patched structures are rejected', () => {
   assert.throws(() => readArchive(Buffer.alloc(16)), /ASAR/);
 });
 
+// 缩小的会话选择边界样例；真实应用管理器另由 CODEX_TEST_ASAR 只读验证。
+const lifecycle = `var retention=108e5;
+class Lifecycle {
+ constructor(){this.entries=new Map;this.active=new Set;this.followers=new Set;this.pinned=new Set;this.owned=new Set}
+ hasActiveConversationView(id){return this.active.has(id)}
+ hasOwnedStreamFollowers(id){return this.followers.has(id)}
+ shouldKeepConversationLoaded(id){return this.pinned.has(id)}
+ ownsConversationHistoryStream(id){return this.owned.has(id)}
+ getNextCheckAtMs(){let next=null;for(const [id,since] of this.entries){if(this.hasActiveConversationView(id)||this.hasOwnedStreamFollowers(id)||this.shouldKeepConversationLoaded(id)||!this.ownsConversationHistoryStream(id))continue;const deadline=since+retention;next=next===null?deadline:Math.min(next,deadline)}return next}
+ getInactiveOwnerConversationIdsToUnsubscribe(now){const result=[];for(const [id,since] of this.entries){if(this.hasActiveConversationView(id)||this.hasOwnedStreamFollowers(id)||this.shouldKeepConversationLoaded(id)||!this.ownsConversationHistoryStream(id))continue;if(now-since>=retention)result.push(id)}this.diagnostics={ttlMs:retention};return result}
+ unsubscribeInactiveConversation(id){this.resumeState='needs_resume';return this.sendRequest('thread/unsubscribe',{threadId:id})}
+}`;
+
 function fixture(version = VERSION) {
   const files = new Map([
     ['package.json', JSON.stringify({ name: 'openai-codex-electron', version })],
     ['.vite/build/main-renamed.js', main], ['webview/assets/webview-page-renamed.js', checkout],
-    ['webview/assets/app-initial-renamed.js', initial], ['webview/assets/app-shared-renamed.js', shared],
+    ['webview/assets/app-initial-renamed.js', initial], ['webview/assets/app-shared-renamed.js', shared + lifecycle],
+    ['.vite/build/bootstrap-renamed.js', lifecycle],
     ['unrelated.txt', 'preserve custom screenshot patch and settings'],
   ]);
   const header = { files: {} }, data = [];
@@ -272,14 +287,14 @@ test('independent copy uses original or verified backups, preserves source and r
   }
 });
 
-test('real ASAR: four transformed modules parse, all packed files and external metadata verify', {
+test('real ASAR: five modules, lifecycle scheduling, packed files and external metadata verify', {
   skip: !process.env.CODEX_TEST_ASAR,
 }, () => {
   const source = sourceForCopy(process.env.CODEX_TEST_ASAR);
   const original = fs.readFileSync(source.asarInput), result = { bytes: source.candidate.asar, report: source.candidate.report };
   assert.equal(result.report.patchVersion, 5);
-  assert.equal(result.report.modules.length, 4);
-  assert.equal(result.report.changes.length, 12);
+  assert.equal(result.report.modules.length, 5);
+  assert.equal(result.report.changes.length, 14);
   verifyContents(original, result.bytes, result.report.modules);
   const originalExe = fs.readFileSync(source.exeInput);
   const resource = executableIntegrity(originalExe), patchedExe = updateExecutable(originalExe, original, result.bytes).bytes;
@@ -287,7 +302,51 @@ test('real ASAR: four transformed modules parse, all packed files and external m
   assert.ok(originalExe.subarray(0, resource.start).equals(patchedExe.subarray(0, resource.start)));
   assert.ok(originalExe.subarray(resource.start + 64).equals(patchedExe.subarray(resource.start + 64)));
   assert.throws(() => buildPatch(result.bytes), /已包含/);
+  const archive = readArchive(original), output = readArchive(result.bytes);
+  for (const name of result.report.modules.filter(n => /bootstrap-|app-shared-/.test(n))) {
+    const input = archive.entry(name).bytes.toString();
+    const patched = transformInactiveThreads(input, 'test').bytes.toString();
+    assert.equal(patched.replace('/*codex-lite-inactive:v1*/300000', '108e5'), input);
+    assert.ok(output.entry(name).bytes.includes(Buffer.from('/*codex-lite-inactive:v1*/300000')));
+    verifyRealLifecycle(patched);
+  }
 });
+
+// 在 VM 中运行真实包的候选选择/定时方法；不向正在运行的后端发送任何请求。
+function verifyRealLifecycle(source) {
+  let owner, ttl, capacity, ephemeral;
+  function visit(node, fields = false) {
+    if (!node || typeof node !== 'object') return;
+    if (['ClassExpression', 'ClassDeclaration'].includes(node.type) && node.body.body.some(n => n.key?.name === 'getInactiveOwnerConversationIdsToUnsubscribe')) owner = node;
+    if (fields && node.type === 'Property' && node.key.name === 'ttlMs' && node.value.type === 'Identifier') ttl = node.value.name;
+    if (fields && node.type === 'Property' && node.key.name === 'maxInactiveOwnerThreads' && node.value.type === 'Identifier') capacity = node.value.name;
+    if (fields && node.type === 'Property' && node.key.name === 'isEphemeralSideConversation' && node.value.type === 'CallExpression') ephemeral = node.value.callee.name;
+    for (const value of Object.values(node)) if (Array.isArray(value)) value.forEach(n => visit(n, fields)); else if (value && typeof value === 'object') visit(value, fields);
+  }
+  visit(acorn.parse(source, { ecmaVersion: 'latest', sourceType: 'module' }));
+  // 只取目标类的词法依赖，避免同模块其他 ttlMs 日志字段覆盖名称。
+  assert.ok(owner); visit(owner, true);
+  assert.ok(owner && ttl && capacity && ephemeral);
+  const Manager = vm.runInNewContext('(' + source.slice(owner.start, owner.end) + ')', { [ttl]: 300000, [capacity]: 10, [ephemeral]: c => c.ephemeral === true });
+  const manager = Object.create(Manager.prototype), states = new Map();
+  manager.inactiveOwnerConversationSinceById = new Map(); manager.inactiveOwnerConversationRetryAtById = new Map();
+  manager.unsubscribingConversationIds = new Set();
+  manager.params = { logger: { debug() {} }, threadStore: { getConversation: id => states.get(id), isConversationActive: id => states.get(id).visible },
+    streamState: { ownsConversationHistoryStream: id => states.get(id).owned, getStreamRole: () => ({ role: 'owner' }), hasFollowersOrPendingFollowerReconnect: id => states.get(id).followers } };
+  manager.shouldKeepConversationLoaded = state => state.keep;
+  for (const id of ['idle', 'visible', 'followers', 'keep', 'unowned', 'resuming', 'retry', 'unsubscribing']) {
+    states.set(id, { resumeState: 'resumed', owned: true }); manager.inactiveOwnerConversationSinceById.set(id, 1000);
+  }
+  states.get('visible').visible = true; states.get('followers').followers = true; states.get('keep').keep = true;
+  states.get('unowned').owned = false; states.get('resuming').resumeState = 'resuming';
+  manager.inactiveOwnerConversationRetryAtById.set('retry', 601000); manager.unsubscribingConversationIds.add('unsubscribing');
+  assert.equal(manager.getNextCheckAtMs(300999), 301000);
+  assert.deepEqual(Array.from(manager.getInactiveOwnerConversationIdsToUnsubscribe(300999)), []);
+  assert.deepEqual(Array.from(manager.getInactiveOwnerConversationIdsToUnsubscribe(301000)), ['idle']);
+  states.get('idle').visible = true;
+  assert.deepEqual(Array.from(manager.getInactiveOwnerConversationIdsToUnsubscribe(301000)), []);
+  assert.equal(manager.getNextCheckAtMs(301000), 601000);
+}
 
 test('in-place upgrade and rollback preserve original/legacy pairs and support copied delivery', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-perf-test-'));
@@ -417,7 +476,7 @@ test('selected installation records survive restart, partial replacement and opt
     applyUpgrade(target, () => {}, selected);
     assert.equal(inspectUpgrade(target, selected).matchesSelection, true);
     assert.equal(inspectUpgrade(target).matchesSelection, false);
-    assert.throws(() => applyUpgrade(target, () => {}, ['menu']), /先原位回滚/);
+    assert.equal(applyUpgrade(target, () => {}, selected).state, 'upgraded');
     const record = JSON.parse(fs.readFileSync(path.join(root, SELECTION_FILE)));
     assert.deepEqual(record.options, selected);
     const output = path.join(directory, 'copy'); createCopy(target, output, ['menu']);
@@ -566,6 +625,89 @@ test('runtime transforms reject incomplete, duplicate and already patched module
     assert.throws(() => transformRuntime(source + '\n{' + source + '\n}', kind), /唯一匹配/);
   }
   const original = fixture(), result = buildOptimizedPatch(original);
-  assert.equal(result.report.modules.length, 4); assert.equal(result.report.changes.length, 12);
+  assert.equal(result.report.modules.length, 5); assert.equal(result.report.changes.length, 14);
   verifyContents(original, result.bytes, result.report.modules);
+});
+
+test('inactive thread retention changes only TTL and preserves eligible-thread boundaries', () => {
+  for (const source of [lifecycle, lifecycle.replace('var retention=108e5;', 'var retention;retention=108e5;')]) {
+    const result = transformInactiveThreads(source, 'main').bytes.toString();
+    assert.equal(result.replace('/*codex-lite-inactive:v1*/300000', '108e5'), source);
+    const Manager = vm.runInNewContext(result + ';Lifecycle'), manager = new Manager();
+    for (const id of ['idle', 'visible', 'follower', 'running', 'unowned']) manager.entries.set(id, 1000);
+    manager.owned = new Set(['idle', 'visible', 'follower', 'running']);
+    manager.active.add('visible'); manager.followers.add('follower'); manager.pinned.add('running');
+    assert.equal(manager.getNextCheckAtMs(), 301000);
+    assert.deepEqual(Array.from(manager.getInactiveOwnerConversationIdsToUnsubscribe(300999)), []);
+    assert.deepEqual(Array.from(manager.getInactiveOwnerConversationIdsToUnsubscribe(301000)), ['idle']);
+    manager.active.add('idle');
+    assert.deepEqual(Array.from(manager.getInactiveOwnerConversationIdsToUnsubscribe(600000)), []);
+    assert.equal(manager.getNextCheckAtMs(), null);
+    assert.throws(() => transformInactiveThreads(result, 'main'), /已包含/);
+  }
+  assert.throws(() => transformInactiveThreads('', 'main'), /唯一匹配/);
+  assert.throws(() => transformInactiveThreads(lifecycle.replace('108e5', '3600000'), 'main'), /3 小时/);
+  assert.throws(() => transformInactiveThreads(lifecycle + '{' + lifecycle + '}', 'main'), /唯一匹配/);
+  assert.throws(() => transformInactiveThreads(lifecycle.replaceAll('hasActiveConversationView', 'changedGuard'), 'main'), /唯一匹配/);
+});
+
+test('older full-selection installs keep their original option set for inspection and rollback', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-perf-test-'));
+  const target = path.join(directory, 'resources', 'app.asar'), exe = path.join(directory, 'ChatGPT.exe');
+  try {
+    fs.mkdirSync(path.dirname(target));
+    const original = fixture(); fs.writeFileSync(target, original); fs.writeFileSync(exe, exeFixture(original));
+    const before = [target, exe].map(hashFile);
+    for (const withRecord of [true, false]) {
+      applyUpgrade(target, () => {}, UNRECORDED_OPTIONS);
+      if (!withRecord) fs.unlinkSync(path.join(directory, SELECTION_FILE));
+      const info = inspectUpgrade(target);
+      assert.equal(info.state, 'upgraded'); assert.equal(info.matchesSelection, false);
+      assert.deepEqual(info.installedOptions, UNRECORDED_OPTIONS);
+      restoreUpgrade(target, () => {});
+      assert.deepEqual([target, exe].map(hashFile), before);
+    }
+  } finally {
+    const relative = path.relative(fs.realpathSync(os.tmpdir()), fs.realpathSync(directory));
+    assert.ok(!relative.startsWith('..') && !path.isAbsolute(relative) && relative.startsWith('codex-perf-test-'));
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('successive upgrades reuse one baseline and recover interrupted old-to-new replacement', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-perf-test-'));
+  const target = path.join(directory, 'resources', 'app.asar'), exe = path.join(directory, 'ChatGPT.exe');
+  const rename = fs.renameSync;
+  try {
+    fs.mkdirSync(path.dirname(target));
+    const original = fixture(); fs.writeFileSync(target, original); fs.writeFileSync(exe, exeFixture(original));
+    const baseline = [target, exe].map(hashFile);
+    applyUpgrade(target, () => {}, UNRECORDED_OPTIONS);
+    const backupPaths = [target, exe].map(file => file + UPGRADE_BACKUP_SUFFIX);
+    const backupTimes = backupPaths.map(file => fs.statSync(file).mtimeMs);
+    for (const selected of [undefined, ['menu'], [], UNRECORDED_OPTIONS]) {
+      applyUpgrade(target, () => {}, selected);
+      assert.equal(inspectUpgrade(target, selected).matchesSelection, true);
+      assert.deepEqual(backupPaths.map(hashFile), baseline);
+      assert.deepEqual(backupPaths.map(file => fs.statSync(file).mtimeMs), backupTimes);
+      assert.equal(fs.readdirSync(directory).filter(n => n.includes('.before-')).length, 1);
+      assert.equal(fs.readdirSync(path.dirname(target)).filter(n => n.includes('.before-')).length, 1);
+    }
+    for (const failingTarget of [target, exe]) {
+      fs.renameSync = (from, to) => { if (to === failingTarget) throw Error('upgrade interrupted'); return rename(from, to); };
+      assert.throws(() => applyUpgrade(target, () => {}), /upgrade interrupted/);
+      fs.renameSync = rename;
+      assert.equal(inspectUpgrade(target).state, 'partial');
+      assert.throws(() => applyUpgrade(target, () => {}), /半完成/);
+      restoreUpgrade(target, () => {});
+      assert.deepEqual([target, exe].map(hashFile), baseline);
+      assert.deepEqual(backupPaths.map(file => fs.statSync(file).mtimeMs), backupTimes);
+      applyUpgrade(target, () => {}, UNRECORDED_OPTIONS);
+    }
+  } finally {
+    fs.renameSync = rename;
+    const relative = path.relative(fs.realpathSync(os.tmpdir()), fs.realpathSync(directory));
+    assert.ok(!relative.startsWith('..') && !path.isAbsolute(relative) && relative.startsWith('codex-perf-test-'));
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });

@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { executableIntegrity, headerHash, updateExecutable } from './exe-integrity.mjs';
-import { transformRuntime } from './runtime-patches.mjs';
+import { transformRuntime, transformInactiveThreads } from './runtime-patches.mjs';
 import { normalizeOptions, selectedEdits } from './options.mjs';
 
 const acorn = createRequire(import.meta.url)('./vendor/acorn.cjs');
@@ -14,6 +14,9 @@ export const MARKER = '/*codex-windows-perf:v2*/';
 export const BACKUP_SUFFIX = '.before-perf-v3';
 export const UPGRADE_BACKUP_SUFFIX = '.before-lite-v5';
 export const SELECTION_FILE = 'codex-lite-install.json';
+// v0.6 无选项记录的安装固定为当时的 11 项，不能随新增默认项改变重建摘要。
+export const UNRECORDED_OPTIONS = ['avatar', 'hotkey', 'detached', 'checkout-pricing', 'checkout-credit', 'menu',
+  'batched-pty-output', 'command-output-items', 'settled-stream-text', 'cached-highlight-language', 'coalesced-mcp-inventory'];
 export const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 function check(condition, message) { if (!condition) throw new Error(message); }
 function walk(node, visit) {
@@ -235,6 +238,12 @@ function buildArchive(original, runtime, selected) {
         new RegExp('^webview/assets/app-' + kind + '-[^/]+\\.js$').test(n)), kind + ' 模块');
       put(name, transformRuntime((replacements.get(name) ?? a.entry(name).bytes).toString(), kind, enabled));
     }
+    if (options.includes('inactive-thread-unsubscribe')) {
+      for (const [kind, pattern] of [['main', /^\.vite\/build\/bootstrap-[^/]+\.js$/], ['renderer', /^webview\/assets\/app-shared-[^/]+\.js$/]]) {
+        const name = only([...a.entries.keys()].filter(n => pattern.test(n)), kind + ' 会话管理模块');
+        put(name, transformInactiveThreads((replacements.get(name) ?? a.entry(name).bytes).toString(), kind));
+      }
+    }
   }
   const bytes = replacements.size ? rewriteArchive(original, replacements) : original;
   const verified = readArchive(bytes);
@@ -319,13 +328,19 @@ export function resolveUpgrade(target, selected, forRestore = false) {
   const selectionText = fs.existsSync(selectionFile) ? fs.readFileSync(selectionFile, 'utf8') : null;
   const saved = selectionText === null ? null : JSON.parse(selectionText);
   if (saved) check(saved.format === 1 && Array.isArray(saved.options) && JSON.stringify(saved.beforeHashes) === JSON.stringify(beforeHashes), '优化选项记录与配套备份不匹配，请核对 codex-lite-install.json。');
-  const installedOptions = normalizeOptions(saved?.options);
+  const installedOptions = normalizeOptions(saved?.options ?? UNRECORDED_OPTIONS);
   const options = forRestore ? installedOptions : normalizeOptions(selected);
   const candidate = buildOptimizedInstallation(original, originalExe, options);
   const installed = atBaseline || JSON.stringify(options) === JSON.stringify(installedOptions) ? candidate : buildOptimizedInstallation(original, originalExe, installedOptions);
   const afterHashes = [candidate.report.candidateSha256, candidate.report.candidateExeSha256];
   const installedHashes = [installed.report.candidateSha256, installed.report.candidateExeSha256];
-  check(currentHashes.every((hash, i) => hash === beforeHashes[i] || hash === installedHashes[i]), '安装文件已有未知后续修改，拒绝覆盖；请核对应用更新、其他补丁或选项记录缺失。');
+  // 跨补丁升级的事务记录保留上一组选项；中断时允许“旧补丁/新补丁”配对回滚至同一基线。
+  let previousHashes = [];
+  if (saved?.previousOptions !== undefined && !currentHashes.every((hash, i) => hash === beforeHashes[i] || hash === installedHashes[i])) {
+    const previous = buildOptimizedInstallation(original, originalExe, normalizeOptions(saved.previousOptions));
+    previousHashes = [previous.report.candidateSha256, previous.report.candidateExeSha256];
+  }
+  check(currentHashes.every((hash, i) => hash === beforeHashes[i] || hash === installedHashes[i] || hash === previousHashes[i]), '安装文件已有未知后续修改，拒绝覆盖；请核对应用更新、其他补丁或选项记录缺失。');
   const state = atBaseline ? beforeState : currentHashes.every((hash, i) => hash === installedHashes[i]) ? 'upgraded' : 'partial';
   const backupsComplete = fs.existsSync(backup) && fs.existsSync(exeBackup);
   check(state !== 'partial' || backupsComplete, '安装处于半完成状态且缺少配套回滚备份。');

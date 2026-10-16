@@ -9,5 +9,6 @@
   { "id": "command-output-items", "label": "命令输出精确更新", "edits": ["command-output-items"] },
   { "id": "settled-stream-text", "label": "合并已完成动画的文字节点", "edits": ["settled-stream-text"] },
   { "id": "cached-highlight-language", "label": "复用代码语言识别结果", "edits": ["cached-highlight-language", "highlight-timer-cleanup"] },
-  { "id": "coalesced-mcp-inventory", "label": "合并 MCP 工具列表刷新", "edits": ["coalesced-mcp-inventory"] }
+  { "id": "coalesced-mcp-inventory", "label": "合并 MCP 工具列表刷新", "edits": ["coalesced-mcp-inventory"] },
+  { "id": "inactive-thread-unsubscribe", "label": "非活跃会话 5 分钟后取消订阅", "edits": ["inactive-thread-unsubscribe-main", "inactive-thread-unsubscribe-renderer"] }
 ]
