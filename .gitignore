@@ -1,0 +1,10 @@
+artifacts/
+copies/
+*.asar
+*.asar.*
+*.log
+node_modules/
+*.zip
+*.exe
+*.dll
+*.node
