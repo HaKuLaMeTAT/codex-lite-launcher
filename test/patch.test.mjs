@@ -7,7 +7,7 @@ import path from 'node:path';
 import { transform, transformCheckout, buildPatch, buildOptimizedPatch, readArchive, sha256, VERSION, BACKUP_SUFFIX, install, restore, inspect, sourceForCopy } from '../patch.mjs';
 import { transformRuntime } from '../runtime-patches.mjs';
 import { inspectUpgrade, applyUpgrade, restoreUpgrade } from '../inplace.mjs';
-import { UPGRADE_BACKUP_SUFFIX } from '../patch.mjs';
+import { UPGRADE_BACKUP_SUFFIX, rewriteArchive } from '../patch.mjs';
 import { executableIntegrity, headerHash, updateExecutable } from '../exe-integrity.mjs';
 import { createCopy, inspectSource, verifyCopy, hashFile, MANIFEST } from '../copy.mjs';
 
@@ -305,6 +305,12 @@ test('in-place upgrade and rollback preserve original/legacy pairs and support c
       assert.equal(inspectUpgrade(target).state, 'upgraded');
       assert.equal(applyUpgrade(target, () => {}).state, 'upgraded');
       assert.deepEqual([target, exe].map(f => hashFile(f + UPGRADE_BACKUP_SUFFIX)), before);
+      if (legacy) {
+        assert.ok(fs.readFileSync(target + BACKUP_SUFFIX).equals(original));
+        fs.unlinkSync(target + BACKUP_SUFFIX); fs.unlinkSync(exe + BACKUP_SUFFIX);
+        assert.equal(inspectUpgrade(target).state, 'upgraded');
+        assert.equal(inspectUpgrade(target).canRestore, true);
+      }
       const output = path.join(directory, 'copy-' + legacy);
       createCopy(target, output);
       assert.equal(hashFile(path.join(output, 'resources', 'app.asar')), hashFile(target));
@@ -315,7 +321,6 @@ test('in-place upgrade and rollback preserve original/legacy pairs and support c
       applyUpgrade(target, () => {});
       fs.appendFileSync(exe, 'unknown');
       assert.throws(() => restoreUpgrade(target, () => {}), /未知后续修改/);
-      if (legacy) assert.ok(fs.readFileSync(target + BACKUP_SUFFIX).equals(original));
     }
   } finally {
     const relative = path.relative(fs.realpathSync(os.tmpdir()), fs.realpathSync(directory));
@@ -331,6 +336,8 @@ test('in-place interrupted replacement can roll back and preflight failures neve
   try {
     fs.mkdirSync(path.dirname(target)); const original = fixture();
     fs.writeFileSync(target, original); fs.writeFileSync(exe, exeFixture(original));
+    install(target, () => {});
+    fs.unlinkSync(target + BACKUP_SUFFIX); fs.unlinkSync(exe + BACKUP_SUFFIX);
     const before = [target, exe].map(hashFile);
     fs.statfsSync = () => ({ bavail: 0, bsize: 4096 });
     assert.throws(() => applyUpgrade(target, () => {}), /磁盘空间不足/);
@@ -354,6 +361,20 @@ test('in-place interrupted replacement can roll back and preflight failures neve
     const relative = path.relative(fs.realpathSync(os.tmpdir()), fs.realpathSync(directory));
     assert.ok(!relative.startsWith('..') && !path.isAbsolute(relative) && relative.startsWith('codex-perf-test-'));
     fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('incremental legacy upgrade matches clean build and rejects damaged legacy structures', () => {
+  const original = fixture(), legacy = buildPatch(original).bytes;
+  assert.ok(buildOptimizedPatch(legacy).bytes.equals(buildOptimizedPatch(original).bytes));
+  const archive = readArchive(legacy);
+  const mainName = [...archive.entries.keys()].find(name => name.startsWith('.vite/build/main-'));
+  const checkoutName = [...archive.entries.keys()].find(name => name.startsWith('webview/assets/webview-page-'));
+  for (const [name, from, to] of [[mainName, 'setTimeout(tick,250)', 'setTimeout(tick,999)'],
+    [mainName, 'return;', 'return 1;'], [checkoutName, '(!1&&(', '(!0&&(']]) {
+    const source = archive.entry(name).bytes.toString(); assert.ok(source.includes(from));
+    const damaged = rewriteArchive(legacy, new Map([[name, Buffer.from(source.replace(from, to))]]));
+    assert.throws(() => buildOptimizedPatch(damaged), /旧补丁/);
   }
 });
 

@@ -177,7 +177,7 @@ $timer.Add_Tick({
         switch ($result.status) {
             'copy-ready' {
                 $status.Text = '来源检查通过，可以生成独立副本'
-                $origin = if ($result.useVerifiedBackups) { '使用配套原始备份；当前已打补丁的安装保持不动。' } else { '使用原安装文件；来源保持不动。' }
+                $origin = if ($result.useVerifiedBackups) { '使用经过验证的配套备份；来源安装保持不动。' } else { '使用经过验证的安装文件；来源保持不动。' }
                 $size = [math]::Round($result.estimatedBytes / 1GB, 2)
                 $details.Text = "应用版本：$($result.version)`r`n$origin`r`n约需 $size GiB 磁盘空间，$($result.fileCount) 个运行文件。`r`n确认副本位置后点击「生成副本」。"
             }

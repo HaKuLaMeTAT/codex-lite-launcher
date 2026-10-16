@@ -68,12 +68,15 @@ export function transform(source) {
   }
   const call = only(matches.menu, 'menu');
   // 首次立即刷新，连续变化约每 250ms 合并一次；会话同步仍每次执行。
-  const text = `${MARKER}(globalThis.__codexWindowsPerfMenuV2??=(()=>{let timer=0,pending=null;` +
-    `const tick=()=>{const run=pending;pending=null;if(run){run();timer=setTimeout(tick,250)}else timer=0};` +
-    `return run=>{if(timer){pending=run;return}run();timer=setTimeout(tick,250)}})())` +
-    `(()=>${source.slice(call.start, call.end)})`;
+  const text = menuPatch(source.slice(call.start, call.end));
   edits.push({ name: 'menu', start: call.start, end: call.end, text });
   return applyEdits(source, edits, 'script');
+}
+function menuPatch(call) {
+  return `${MARKER}(globalThis.__codexWindowsPerfMenuV2??=(()=>{let timer=0,pending=null;` +
+    `const tick=()=>{const run=pending;pending=null;if(run){run();timer=setTimeout(tick,250)}else timer=0};` +
+    `return run=>{if(timer){pending=run;return}run();timer=setTimeout(tick,250)}})())` +
+    `(()=>${call})`;
 }
 
 export function transformCheckout(source) {
@@ -168,9 +171,42 @@ function modules(original) {
     a.entry(n).bytes.includes(Buffer.from('CheckoutPricingWebviewHost'))), '购买模块');
   return { a, pkg, main, checkout };
 }
+// 原始备份可被清理：先验证旧补丁的完整结构，再仅追加运行时优化，不能只凭标记跳过检查。
+function verifyLegacy(main, checkout) {
+  const matches = { avatar: [], hotkey: [], detached: [], menu: [], pricing: [], credit: [] };
+  check(main.split(MARKER).length === 5 && checkout.split(MARKER).length === 3, '旧补丁标记不完整或重复。');
+  walk(parse(main, 'script'), node => {
+    if (node.type === 'MethodDefinition' && main.slice(node.value.body.start, node.value.body.end) === `{${MARKER}return;}`) {
+      const fn = node.value;
+      if (node.key.name === 'prewarm' && fn.async && fn.params.length === 1) matches.avatar.push(node);
+      if (node.key.name === 'prewarm' && fn.async && fn.params.length === 0) matches.hotkey.push(node);
+      if (node.key.name === 'scheduleFill' && fn.params.length === 0) matches.detached.push(node);
+    }
+    if (node.type !== 'CallExpression' || node.callee.property?.name !== 'setOnBrowserStateChanged' || node.arguments.length !== 1) return;
+    const fn = node.arguments[0];
+    if (fn.type !== 'ArrowFunctionExpression' || fn.params.length !== 0) return;
+    walk(fn.body, inner => {
+      if (inner.type === 'CallExpression' && inner.arguments.length === 0 && inner.callee.property?.name === 'refreshApplicationMenu' &&
+          main.slice(fn.body.start, fn.body.end).includes(menuPatch(main.slice(inner.start, inner.end)))) matches.menu.push(inner);
+    });
+  });
+  walk(parse(checkout, 'module'), node => {
+    if (node.type !== 'LogicalExpression' || node.left.type !== 'UnaryExpression' || node.left.operator !== '!' || node.left.argument.type !== 'Literal') return;
+    const prefix = checkout.slice(node.start - MARKER.length - 1, node.start);
+    if (prefix !== MARKER + '(' || checkout[node.end] !== ')') return;
+    const right = checkout.slice(node.right.start, node.right.end);
+    if (node.operator === '&&' && node.left.argument.value === 1 && right.includes('`use_embedded_checkout`')) matches.pricing.push(node);
+    if (node.operator === '||' && node.left.argument.value === 0 && right.includes('`use_embedded_credit_checkout`')) matches.credit.push(node);
+  });
+  for (const [name, found] of Object.entries(matches)) only(found, `旧补丁 ${name}`);
+}
 function buildArchive(original, runtime) {
   const { a, pkg, main, checkout } = modules(original);
-  const m = transform(a.entry(main).bytes.toString()), c = transformCheckout(a.entry(checkout).bytes.toString());
+  const mainSource = a.entry(main).bytes.toString(), checkoutSource = a.entry(checkout).bytes.toString();
+  const legacy = runtime && (mainSource.includes(MARKER) || checkoutSource.includes(MARKER));
+  if (legacy) verifyLegacy(mainSource, checkoutSource);
+  const m = legacy ? { bytes: a.entry(main).bytes, edits: ['avatar', 'hotkey', 'detached', 'menu'].map(name => ({ name })) } : transform(mainSource);
+  const c = legacy ? { bytes: a.entry(checkout).bytes, edits: ['checkout-pricing', 'checkout-credit'].map(name => ({ name })) } : transformCheckout(checkoutSource);
   const replacements = new Map([[main, m.bytes], [checkout, c.bytes]]), changes = [...m.edits, ...c.edits];
   if (runtime) {
     for (const kind of ['main', 'initial', 'shared']) {
@@ -254,6 +290,9 @@ export function resolveUpgrade(target) {
     const legacyPair = sha256(beforeAsar) === legacy.report.candidateSha256 && sha256(beforeExe) === legacy.report.candidateExeSha256;
     check(originalPair || legacyPair, '升级前文件不是完整原版或 v0.3 配套版本，拒绝覆盖。');
     beforeState = legacyPair ? 'patched' : 'ready';
+  } else {
+    const base = modules(original);
+    if (base.a.entry(base.main).bytes.includes(Buffer.from(MARKER))) beforeState = 'patched';
   }
   const candidate = buildOptimizedInstallation(original, originalExe);
   const beforeHashes = [sha256(beforeAsar), sha256(beforeExe)], currentHashes = [sha256(currentAsar), sha256(currentExe)];
