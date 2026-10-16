@@ -58,7 +58,7 @@ cd codex-lite-launcher
 ```
 
 1. 检查自动识别的来源安装；必要时点击“选择来源”。支持原版、保留可验证配套备份的 v0.3 安装，以及本工具已原位升级的安装。
-2. 在顶部选择模式，再点击“检查来源”。
+2. 在顶部选择模式，在优化列表中保留所需勾选，再点击“检查来源”。所有 11 项默认选中，购买与充值分别可选；高亮识别复用与其定时器清理作为一个选项一起启停。修改勾选后必须重新检查。
 
 | 模式 | 操作 | 磁盘占用 |
 |---|---|---|
@@ -66,6 +66,10 @@ cd codex-lite-launcher
 | 独立副本 | 选择尚不存在的目录，点击“生成副本”；退出其他 Codex 后，双击副本中的 `启动优化版.cmd` | 适配版本约 2.2 GiB，保留来源安装 |
 
 原位升级同时替换 EXE 和 ASAR，不能只替换 EXE。升级前文件保存为同目录的 `.before-lite-v5` 配套备份，已有 `.before-perf-v3` 原始备份保留。撤回时，退出 Codex，在“原位升级”模式重新检查并点击“原位回滚”，恢复到本次升级前状态。不要删除配套备份。替换中途失败时保持 Codex 关闭，重新检查后回滚，不要启动半完成安装。
+
+v0.7 原位升级额外保存 `codex-lite-install.json`，用于记录所选优化并识别部分替换；请与两份回滚备份一起保留。回滚读取安装记录，不受界面当前勾选影响。已经应用补丁后需要更换组合时，先回滚，再重新勾选、检查和升级；副本可直接使用新组合生成到新目录，清单会记录所选项。全不选时不新增优化：干净安装的原位操作不替换文件，也不新增备份；副本仍复制运行文件。
+
+未勾选项不参与变换及其匹配点检查，但**选项开关不等于跨版本支持**。换 Codex 版本后仍需审计版本和所选优化的结构，再更新适配范围；本次没有放开未知版本限制。
 
 工具不会自动关闭或启动 Codex，也不修改快捷方式。原位操作会检查运行进程和可用空间。生成副本期间可以保持当前应用运行，但不要同时更新来源安装。默认副本输出为工具目录下的 `copies/Codex-optimized`，再次生成需使用新目录，不覆盖已有副本。失败时保留 `.building` 目录供检查，不应从该目录运行应用。
 
@@ -87,9 +91,11 @@ cd codex-lite-launcher
 
 回滚恢复的是 `.before-lite-v5` 中保存的升级前版本。如果它是 v0.3 补丁版，回滚后仍是 v0.3，不会恢复成官方原版。请保留这两份配套回滚文件；工具不会重建已删除的官方原始备份。
 
+如果旧原始备份已删除，剩余 v0.3 文件中的旧优化不能被取消；工具会明确拒绝这种选择。要关闭宠物、快捷/分离窗口、菜单、购买/充值中的旧优化，需要使用干净安装或保留可验证的原始备份。v0.6 及更早的全选安装无需新增记录即可检查和回滚。
+
 生成时复制运行文件（排除旧补丁备份），校验每个输出文件，并再次核对来源未变化；全部通过后才将 `.building` 改名为目标目录。`codex-optimized-copy.json` 清单用于一致性检查，不是数字签名。暂不支持含链接的来源。
 
-ASAR 重建只改变四个目标模块、对应摘要和必要偏移，保留其他内容及 unpacked 元数据。EXE 精确更新 `INTEGRITY/ELECTRONASAR` 资源中的 64 字节头部 SHA-256，不关闭完整性校验开关。修改 EXE 不能保留原始 Authenticode 签名有效性，本工具不重签名。
+ASAR 重建只改变所选优化涉及的目标模块、对应摘要和必要偏移，保留其他内容及 unpacked 元数据。EXE 精确更新 `INTEGRITY/ELECTRONASAR` 资源中的 64 字节头部 SHA-256，不关闭完整性校验开关。修改 EXE 不能保留原始 Authenticode 签名有效性，本工具不重签名。
 
 ## 开发与验证
 
@@ -103,6 +109,10 @@ node .\inplace.mjs inspect 'C:\Apps\Codex\app\resources\app.asar'
 # apply/restore 前完全退出 Codex 桌面和 CLI。
 node .\inplace.mjs apply 'C:\Apps\Codex\app\resources\app.asar'
 node .\inplace.mjs restore 'C:\Apps\Codex\app\resources\app.asar'
+# 示例：仅选择菜单合并与终端输出合并；省略 --options 时全选。
+node .\inplace.mjs inspect 'C:\Apps\Codex\app\resources\app.asar' --options=menu,batched-pty-output
+node .\copy.mjs create 'C:\Apps\Codex\app\resources\app.asar' 'C:\Apps\Codex-selected' --options=menu,batched-pty-output
+# 全不选使用 --options=none；完整标识与名称见 options.json。
 node --test .\test\patch.test.mjs
 
 # 额外只读验证真实安装和配套原文件；未设置时真实包测试显示 skipped。

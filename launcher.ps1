@@ -1,5 +1,5 @@
 ﻿param([switch]$SmokeTest, [string]$TargetPath, [string]$ScreenshotPath,
-    [ValidateSet('copy','inplace')][string]$Mode = 'copy')
+    [ValidateSet('copy','inplace')][string]$Mode = 'copy', [string]$SelectedOptions = 'all')
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
@@ -29,8 +29,8 @@ function Find-Installation {
 }
 
 $form = New-Object Windows.Forms.Form
-$form.Text = 'Codex 轻启 v0.6.0'
-$form.ClientSize = New-Object Drawing.Size(720, 580)
+$form.Text = 'Codex 轻启 v0.7.0'
+$form.ClientSize = New-Object Drawing.Size(720, 750)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
@@ -69,37 +69,56 @@ $outputBrowse.Text = '副本位置'
 $outputBrowse.SetBounds(596, 195, 101, 32)
 $form.Controls.Add($outputBrowse)
 
+# 从共享目录读取选项，界面与命令行使用相同标识；默认全选。
+# Windows PowerShell 5.1 的 ConvertFrom-Json 将数组作为单个管道对象输出，直接赋值避免再包一层。
+$optionDefinitions = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'options.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+$optionLabel = New-Object Windows.Forms.Label
+$optionLabel.Text = '性能优化项（默认全选，修改勾选后需重新检查）'
+$optionLabel.SetBounds(22, 236, 675, 24)
+$form.Controls.Add($optionLabel)
+$optionList = New-Object Windows.Forms.CheckedListBox
+$optionList.CheckOnClick = $true
+$optionList.MultiColumn = $true
+$optionList.ColumnWidth = 332
+$optionList.IntegralHeight = $false
+$optionList.SetBounds(22, 264, 675, 145)
+foreach ($option in $optionDefinitions) {
+    $checked = $SelectedOptions -eq 'all' -or ($SelectedOptions -split ',') -contains $option.id
+    [void]$optionList.Items.Add($option.label, $checked)
+}
+$form.Controls.Add($optionList)
+
 $checkButton = New-Object Windows.Forms.Button
 $checkButton.Text = '检查来源'
-$checkButton.SetBounds(22, 247, 100, 36)
+$checkButton.SetBounds(22, 426, 100, 36)
 $applyButton = New-Object Windows.Forms.Button
 $applyButton.Text = '生成副本'
-$applyButton.SetBounds(134, 247, 100, 36)
+$applyButton.SetBounds(134, 426, 100, 36)
 $applyButton.Enabled = $false
 $openButton = New-Object Windows.Forms.Button
 $openButton.Text = '打开副本目录'
-$openButton.SetBounds(378, 247, 130, 36)
+$openButton.SetBounds(378, 426, 130, 36)
 $openButton.Enabled = $false
 $restoreButton = New-Object Windows.Forms.Button
 $restoreButton.Text = '原位回滚'
-$restoreButton.SetBounds(246, 247, 120, 36)
+$restoreButton.SetBounds(246, 426, 120, 36)
 $restoreButton.Enabled = $false
 $form.Controls.AddRange(@($checkButton, $applyButton, $restoreButton, $openButton))
 
 $status = New-Object Windows.Forms.Label
 $status.Text = '请选择来源安装目录，然后检查。'
-$status.SetBounds(22, 300, 675, 27)
+$status.SetBounds(22, 478, 675, 27)
 $form.Controls.Add($status)
 $details = New-Object Windows.Forms.TextBox
 $details.Multiline = $true
 $details.ReadOnly = $true
 $details.ScrollBars = 'Vertical'
-$details.SetBounds(22, 333, 675, 171)
+$details.SetBounds(22, 511, 675, 171)
 $details.Text = "生成期间可以继续使用当前 Codex；不要同时更新来源安装。`r`n副本包含完整运行资源，另占一份安装的磁盘空间。`r`n生成后不会自动启动或替换原版入口。"
 $form.Controls.Add($details)
 $note = New-Object Windows.Forms.Label
 $note.Text = '实验工具，需要 Node.js 20+。原位升级/回滚前须完全退出 Codex。'
-$note.SetBounds(22, 528, 675, 28)
+$note.SetBounds(22, 708, 675, 28)
 $form.Controls.Add($note)
 
 $script:worker = $null
@@ -141,6 +160,11 @@ function Start-Operation([string]$Command) {
             if ($destination.Contains('"')) { throw '副本目录不能包含双引号。' }
             $info.Arguments += ' "' + $destination.TrimEnd('\') + '"'
         }
+        if ($Command -ne 'restore') {
+            $ids = @($optionList.CheckedIndices | ForEach-Object { $optionDefinitions[$_].id })
+            $selection = if ($ids.Count -eq 0) { 'none' } else { $ids -join ',' }
+            $info.Arguments += ' --options=' + $selection
+        }
         $info.UseShellExecute = $false
         $info.CreateNoWindow = $true
         $info.RedirectStandardOutput = $true
@@ -153,13 +177,13 @@ function Start-Operation([string]$Command) {
         # 异步读取管道，避免长输出阻塞；UI 定时器只收取完成结果。
         $script:stdoutTask = $script:worker.StandardOutput.ReadToEndAsync()
         $script:stderrTask = $script:worker.StandardError.ReadToEndAsync()
-        foreach ($control in @($modeBox, $location, $browse, $outputPath, $outputBrowse, $checkButton, $applyButton, $restoreButton, $openButton)) { $control.Enabled = $false }
+        foreach ($control in @($modeBox, $optionList, $location, $browse, $outputPath, $outputBrowse, $checkButton, $applyButton, $restoreButton, $openButton)) { $control.Enabled = $false }
         $status.Text = @{ inspect = '正在检查来源…'; create = '正在复制并校验完整应用，请等待…'; apply = '正在备份、校验并原位升级…'; restore = '正在校验并回滚升级前版本…' }[$Command]
         $timer.Start()
     } catch {
         $status.Text = '未执行操作'
         $details.Text = $_.Exception.Message
-        if ($SmokeTest) { $form.Close() }
+        if ($SmokeTest) { [Console]::Error.WriteLine($_.Exception.Message); $form.Close() }
     }
 }
 
@@ -188,26 +212,34 @@ $timer.Add_Tick({
             }
             { $_ -in @('upgrade-ready','upgrade-applied','upgrade-restored') } {
                 $restoreButton.Enabled = $result.canRestore
-                $applyButton.Enabled = $result.state -in @('ready','patched')
+                $applyButton.Enabled = $result.state -in @('ready','patched') -and -not $result.matchesSelection
                 $required = [math]::Round($result.requiredFreeBytes / 1GB, 2)
                 $free = [math]::Round($result.freeBytes / 1GB, 2)
                 if ($result.state -eq 'partial') { $status.Text = '检测到半完成替换，请保持 Codex 关闭并原位回滚' }
-                elseif ($result.state -eq 'upgraded') { $status.Text = '当前安装已完成优化，可按原方式启动' }
+                elseif ($result.state -eq 'upgraded') { $status.Text = if ($result.matchesSelection) { '当前安装与所选优化一致，可按原方式启动' } else { '当前已应用另一组选项；请先回滚，再按新选择升级' } }
                 elseif ($result.status -eq 'upgrade-restored') { $status.Text = '已回滚至本次原位升级前的版本' }
+                elseif ($result.matchesSelection) { $status.Text = '所选优化已满足，无需替换文件' }
                 else { $status.Text = '检查通过，退出 Codex 后可原位升级' }
                 $details.Text = "应用版本：$($result.version)`r`n本次准备约需 $required GiB 可用空间，当前可用 $free GiB。`r`n回滚备份：$($result.backup)`r`nEXE 备份：$($result.exeBackup)`r`n升级和回滚同时处理两个文件；不会自动关闭或启动 Codex。"
             }
             default { throw '工具返回了未知状态，请检查补丁文件是否完整。' }
         }
+        $names = @($optionDefinitions | Where-Object { $result.selectedOptions -contains $_.id } | ForEach-Object { $_.label })
+        $summary = if ($names.Count) { $names -join '、' } else { '不新增优化' }
+        $details.Text += "`r`n所选优化：$summary"
+        if ($SmokeTest) {
+            [Console]::WriteLine((@{ status = $result.status; itemCount = $optionList.Items.Count; checkedCount = $optionList.CheckedItems.Count; selectedOptions = $result.selectedOptions } | ConvertTo-Json -Compress))
+        }
         $script:smokeExit = 0
     } catch {
         $status.Text = '操作未完成'
+        if ($SmokeTest) { [Console]::Error.WriteLine($_.Exception.Message) }
         $details.Text = $_.Exception.Message + "`r`n请处理上述原因后重新检查。若提示访问被拒绝，请确认目录权限。"
     } finally {
         $script:worker.Dispose()
         $script:worker = $null
         $location.Enabled = $true; $browse.Enabled = $true; $checkButton.Enabled = $true
-        $modeBox.Enabled = $true
+        $modeBox.Enabled = $true; $optionList.Enabled = $true
         $outputPath.Enabled = $modeBox.SelectedIndex -eq 0; $outputBrowse.Enabled = $modeBox.SelectedIndex -eq 0
         if ($ScreenshotPath) {
             $bitmap = New-Object Drawing.Bitmap($form.Width, $form.Height)
@@ -217,6 +249,10 @@ $timer.Add_Tick({
         }
         if ($SmokeTest) { $form.Close() }
     }
+})
+$optionList.Add_ItemCheck({
+    $applyButton.Enabled = $false; $openButton.Enabled = $false
+    $status.Text = '勾选已改变，请重新检查；回滚始终使用上次安装记录。'
 })
 $location.Add_TextChanged({ $applyButton.Enabled = $false; $restoreButton.Enabled = $false; $openButton.Enabled = $false })
 $modeBox.Add_SelectedIndexChanged({ Reset-Mode })

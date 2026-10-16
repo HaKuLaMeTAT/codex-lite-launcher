@@ -10,6 +10,8 @@ import { inspectUpgrade, applyUpgrade, restoreUpgrade } from '../inplace.mjs';
 import { UPGRADE_BACKUP_SUFFIX, rewriteArchive } from '../patch.mjs';
 import { executableIntegrity, headerHash, updateExecutable } from '../exe-integrity.mjs';
 import { createCopy, inspectSource, verifyCopy, hashFile, MANIFEST } from '../copy.mjs';
+import { OPTIONS, normalizeOptions, parseOptionsArgument } from '../options.mjs';
+import { SELECTION_FILE } from '../patch.mjs';
 
 function exeFixture(asar) {
   const exe = Buffer.alloc(0x800);
@@ -375,6 +377,71 @@ test('incremental legacy upgrade matches clean build and rejects damaged legacy 
     const source = archive.entry(name).bytes.toString(); assert.ok(source.includes(from));
     const damaged = rewriteArchive(legacy, new Map([[name, Buffer.from(source.replace(from, to))]]));
     assert.throws(() => buildOptimizedPatch(damaged), /旧补丁/);
+  }
+});
+
+test('selectable optimizations cover individual choices, disabled matchers and grouped cleanup', () => {
+  const original = fixture();
+  assert.ok(buildOptimizedPatch(original).bytes.equals(buildOptimizedPatch(original, OPTIONS.map(o => o.id)).bytes));
+  assert.ok(buildOptimizedPatch(original, []).bytes.equals(original));
+  for (const option of OPTIONS) {
+    const result = buildOptimizedPatch(original, [option.id]);
+    assert.deepEqual(result.report.selectedOptions, [option.id]);
+    assert.deepEqual([...result.report.changes].sort(), [...option.edits].sort());
+    verifyContents(original, result.bytes, result.report.modules);
+  }
+  const archive = readArchive(original), initialName = [...archive.entries.keys()].find(n => n.startsWith('webview/assets/app-initial-'));
+  const changed = rewriteArchive(original, new Map([[initialName, Buffer.from('invalid syntax !')]]));
+  assert.deepEqual(buildOptimizedPatch(changed, ['menu']).report.changes, ['menu']);
+  assert.throws(() => buildOptimizedPatch(changed, ['settled-stream-text']));
+  assert.throws(() => buildOptimizedPatch(buildPatch(original).bytes, ['menu']), /不能取消/);
+  assert.throws(() => buildOptimizedPatch(fixture('99.0.0'), ['menu']), /暂不支持版本/);
+  assert.throws(() => normalizeOptions(['unknown']), /未知/);
+  assert.throws(() => normalizeOptions(['menu', 'menu']), /重复/);
+  assert.deepEqual(parseOptionsArgument('--options=none'), []);
+  assert.throws(() => parseOptionsArgument('--options='), /未知/);
+});
+
+test('selected installation records survive restart, partial replacement and option-independent rollback', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-perf-test-'));
+  const root = path.join(directory, 'source'), target = path.join(root, 'resources', 'app.asar'), exe = path.join(root, 'ChatGPT.exe');
+  const rename = fs.renameSync;
+  try {
+    fs.mkdirSync(path.join(root, 'resources', 'app.asar.unpacked'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'locales')); fs.writeFileSync(path.join(root, 'chrome.dll'), 'fixture');
+    const original = fixture(); fs.writeFileSync(target, original); fs.writeFileSync(exe, exeFixture(original));
+    const before = [target, exe].map(hashFile);
+    applyUpgrade(target, () => {}, []);
+    assert.equal(fs.existsSync(target + UPGRADE_BACKUP_SUFFIX), false);
+    const selected = ['menu', 'cached-highlight-language'];
+    applyUpgrade(target, () => {}, selected);
+    assert.equal(inspectUpgrade(target, selected).matchesSelection, true);
+    assert.equal(inspectUpgrade(target).matchesSelection, false);
+    assert.throws(() => applyUpgrade(target, () => {}, ['menu']), /先原位回滚/);
+    const record = JSON.parse(fs.readFileSync(path.join(root, SELECTION_FILE)));
+    assert.deepEqual(record.options, selected);
+    const output = path.join(directory, 'copy'); createCopy(target, output, ['menu']);
+    const manifest = JSON.parse(fs.readFileSync(path.join(output, MANIFEST)));
+    assert.deepEqual(manifest.selectedOptions, ['menu']);
+    assert.equal(fs.existsSync(path.join(output, SELECTION_FILE)), false);
+    assert.ok(fs.readFileSync(path.join(output, 'resources', 'app.asar')).equals(buildOptimizedPatch(original, ['menu']).bytes));
+    restoreUpgrade(target, () => {});
+    assert.deepEqual([target, exe].map(hashFile), before);
+    // 无需重新勾选安装时的组合，记录能识别部分替换并恢复。
+    fs.renameSync = (from, to) => { if (to === exe) throw Error('injected'); return rename(from, to); };
+    assert.throws(() => applyUpgrade(target, () => {}, ['menu']), /injected/);
+    fs.renameSync = rename;
+    assert.equal(inspectUpgrade(target).state, 'partial');
+    restoreUpgrade(target, () => {});
+    assert.deepEqual([target, exe].map(hashFile), before);
+    applyUpgrade(target, () => {}, ['batched-pty-output']);
+    fs.unlinkSync(path.join(root, SELECTION_FILE));
+    assert.throws(() => inspectUpgrade(target), /选项记录缺失/);
+  } finally {
+    fs.renameSync = rename;
+    const relative = path.relative(fs.realpathSync(os.tmpdir()), fs.realpathSync(directory));
+    assert.ok(!relative.startsWith('..') && !path.isAbsolute(relative) && relative.startsWith('codex-perf-test-'));
+    fs.rmSync(directory, { recursive: true, force: true });
   }
 });
 

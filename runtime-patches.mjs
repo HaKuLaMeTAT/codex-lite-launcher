@@ -99,7 +99,7 @@ function walk(node, visit, ancestors = []) {
 const member = (node, name) => node?.type === 'CallExpression' && node.callee.type === 'MemberExpression' && node.callee.property.name === name;
 const label = node => node?.type === 'Literal' ? node.value : node?.type === 'TemplateLiteral' && node.expressions.length === 0 ? node.quasis[0].value.cooked : null;
 
-export function transformRuntime(source, kind) {
+export function transformRuntime(source, kind, selected) {
   if (source.includes(RUNTIME_MARKER)) throw new Error('已包含运行时优化补丁。');
   const type = kind === 'main' ? 'script' : 'module';
   const tree = acorn.parse(source, { ecmaVersion: 'latest', sourceType: type }), matches = new Map();
@@ -181,7 +181,7 @@ export function transformRuntime(source, kind) {
   const required = { main: ['batched-pty-output'], initial: ['settled-stream-text', 'coalesced-mcp-inventory'],
     shared: ['command-output-items', 'cached-highlight-language', 'highlight-timer-cleanup'] }[kind];
   if (!required) throw new Error(`未知模块类型：${kind}`);
-  const edits = required.map(name => {
+  const edits = required.filter(name => selected === undefined || selected.includes(name)).map(name => {
     const found = matches.get(name) ?? [];
     if (found.length !== 1) throw new Error(`${name}：应唯一匹配，实际匹配 ${found.length} 处。此包暂不支持。`);
     return found[0];

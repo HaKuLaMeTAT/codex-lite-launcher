@@ -6,12 +6,14 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { executableIntegrity, headerHash, updateExecutable } from './exe-integrity.mjs';
 import { transformRuntime } from './runtime-patches.mjs';
+import { normalizeOptions, selectedEdits } from './options.mjs';
 
 const acorn = createRequire(import.meta.url)('./vendor/acorn.cjs');
 export const VERSION = '26.928.20755';
 export const MARKER = '/*codex-windows-perf:v2*/';
 export const BACKUP_SUFFIX = '.before-perf-v3';
 export const UPGRADE_BACKUP_SUFFIX = '.before-lite-v5';
+export const SELECTION_FILE = 'codex-lite-install.json';
 export const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 function check(condition, message) { if (!condition) throw new Error(message); }
 function walk(node, visit) {
@@ -37,7 +39,7 @@ function applyEdits(source, edits, type) {
 }
 
 // 改编自 Codex++ 固定提交：仅匹配预加载入口及菜单刷新调用。
-export function transform(source) {
+export function transform(source, selected = ['avatar', 'hotkey', 'detached', 'menu']) {
   check(!source.includes(MARKER), '此主模块已包含 v2 补丁。');
   const matches = { avatar: [], hotkey: [], detached: [], menu: [] };
   walk(parse(source, 'script'), node => {
@@ -63,13 +65,16 @@ export function transform(source) {
   });
   const edits = [];
   for (const name of ['avatar', 'hotkey', 'detached']) {
+    if (!selected.includes(name)) continue;
     const fn = only(matches[name], name);
     edits.push({ name, start: fn.body.start + 1, end: fn.body.end - 1, text: `${MARKER}return;` });
   }
-  const call = only(matches.menu, 'menu');
-  // 首次立即刷新，连续变化约每 250ms 合并一次；会话同步仍每次执行。
-  const text = menuPatch(source.slice(call.start, call.end));
-  edits.push({ name: 'menu', start: call.start, end: call.end, text });
+  if (selected.includes('menu')) {
+    const call = only(matches.menu, 'menu');
+    // 首次立即刷新，连续变化约每 250ms 合并一次；会话同步仍每次执行。
+    const text = menuPatch(source.slice(call.start, call.end));
+    edits.push({ name: 'menu', start: call.start, end: call.end, text });
+  }
   return applyEdits(source, edits, 'script');
 }
 function menuPatch(call) {
@@ -79,7 +84,7 @@ function menuPatch(call) {
     `(()=>${call})`;
 }
 
-export function transformCheckout(source) {
+export function transformCheckout(source, selected = ['checkout-pricing', 'checkout-credit']) {
   check(!source.includes(MARKER), '此购买模块已包含 v2 补丁。');
   const pricing = [], credit = [];
   walk(parse(source, 'module'), node => {
@@ -89,12 +94,17 @@ export function transformCheckout(source) {
         node.right.type === 'LogicalExpression' && node.right.operator === '||' &&
         source.slice(node.right.start, node.right.end).includes('`use_embedded_credit_checkout`')) credit.push(node);
   });
-  const p = only(pricing, 'checkout-pricing'), c = only(credit, 'checkout-credit');
   // 只关闭预热条件，保留显式购买和充值路由。
-  return applyEdits(source, [
-    { name: 'checkout-pricing', start: p.test.start, end: p.test.end, text: `${MARKER}(!1&&(${source.slice(p.test.start, p.test.end)}))` },
-    { name: 'checkout-credit', start: c.right.start, end: c.right.end, text: `${MARKER}(!0||(${source.slice(c.right.start, c.right.end)}))` },
-  ], 'module');
+  const edits = [];
+  if (selected.includes('checkout-pricing')) {
+    const p = only(pricing, 'checkout-pricing');
+    edits.push({ name: 'checkout-pricing', start: p.test.start, end: p.test.end, text: `${MARKER}(!1&&(${source.slice(p.test.start, p.test.end)}))` });
+  }
+  if (selected.includes('checkout-credit')) {
+    const c = only(credit, 'checkout-credit');
+    edits.push({ name: 'checkout-credit', start: c.right.start, end: c.right.end, text: `${MARKER}(!0||(${source.slice(c.right.start, c.right.end)}))` });
+  }
+  return applyEdits(source, edits, 'module');
 }
 
 export function readArchive(bytes) {
@@ -161,13 +171,13 @@ export function rewriteArchive(original, replacements) {
   parts.push(original.subarray(cursor));
   return Buffer.concat(parts);
 }
-function modules(original) {
+function modules(original, needCheckout = true) {
   const a = readArchive(original), pkg = JSON.parse(a.entry('package.json').bytes);
   check(pkg.name === 'openai-codex-electron', '所选安装包不是 Codex 桌面应用。');
   // 通用定位不等于跨版本验证；新增版本必须先审计再加入支持范围。
   check(pkg.version === VERSION, `暂不支持版本 ${pkg.version}；当前已适配 ${VERSION}。未修改文件。`);
   const main = only([...a.entries.keys()].filter(n => /^\.vite\/build\/main-[^/]+\.js$/.test(n)), '主模块');
-  const checkout = only([...a.entries.keys()].filter(n => /^webview\/assets\/webview-page-[^/]+\.js$/.test(n) &&
+  const checkout = !needCheckout ? null : only([...a.entries.keys()].filter(n => /^webview\/assets\/webview-page-[^/]+\.js$/.test(n) &&
     a.entry(n).bytes.includes(Buffer.from('CheckoutPricingWebviewHost'))), '购买模块');
   return { a, pkg, main, checkout };
 }
@@ -200,38 +210,47 @@ function verifyLegacy(main, checkout) {
   });
   for (const [name, found] of Object.entries(matches)) only(found, `旧补丁 ${name}`);
 }
-function buildArchive(original, runtime) {
-  const { a, pkg, main, checkout } = modules(original);
-  const mainSource = a.entry(main).bytes.toString(), checkoutSource = a.entry(checkout).bytes.toString();
-  const legacy = runtime && (mainSource.includes(MARKER) || checkoutSource.includes(MARKER));
-  if (legacy) verifyLegacy(mainSource, checkoutSource);
-  const m = legacy ? { bytes: a.entry(main).bytes, edits: ['avatar', 'hotkey', 'detached', 'menu'].map(name => ({ name })) } : transform(mainSource);
-  const c = legacy ? { bytes: a.entry(checkout).bytes, edits: ['checkout-pricing', 'checkout-credit'].map(name => ({ name })) } : transformCheckout(checkoutSource);
-  const replacements = new Map([[main, m.bytes], [checkout, c.bytes]]), changes = [...m.edits, ...c.edits];
+function buildArchive(original, runtime, selected) {
+  const options = normalizeOptions(selected), enabled = runtime ? selectedEdits(options) : ['avatar', 'hotkey', 'detached', 'menu', 'checkout-pricing', 'checkout-credit'];
+  const { a, pkg, main, checkout } = modules(original, enabled.some(id => id.startsWith('checkout-')));
+  const mainSource = a.entry(main).bytes.toString();
+  const legacy = runtime && mainSource.includes(MARKER);
+  const replacements = new Map(), changes = [];
+  const put = (name, result) => { if (result.edits.length) { replacements.set(name, result.bytes); changes.push(...result.edits); } };
+  if (legacy) {
+    const inherited = ['avatar', 'hotkey', 'detached', 'menu', 'checkout-pricing', 'checkout-credit'];
+    check(inherited.every(id => enabled.includes(id)), '来源已包含 v0.3 旧优化，缺少原始备份，不能取消这些旧优化；请选择干净安装。');
+    verifyLegacy(mainSource, a.entry(checkout).bytes.toString());
+    put(main, { bytes: a.entry(main).bytes, edits: inherited.slice(0, 4).map(name => ({ name })) });
+    put(checkout, { bytes: a.entry(checkout).bytes, edits: inherited.slice(4).map(name => ({ name })) });
+  } else {
+    if (enabled.some(id => ['avatar', 'hotkey', 'detached', 'menu'].includes(id))) put(main, transform(mainSource, enabled));
+    if (checkout) put(checkout, transformCheckout(a.entry(checkout).bytes.toString(), enabled));
+  }
   if (runtime) {
-    for (const kind of ['main', 'initial', 'shared']) {
+    const groups = { main: ['batched-pty-output'], initial: ['settled-stream-text', 'coalesced-mcp-inventory'], shared: ['command-output-items', 'cached-highlight-language', 'highlight-timer-cleanup'] };
+    for (const [kind, ids] of Object.entries(groups)) {
+      if (!ids.some(id => enabled.includes(id))) continue;
       const name = kind === 'main' ? main : only([...a.entries.keys()].filter(n =>
-        new RegExp(`^webview/assets/app-${kind}-[^/]+\\.js$`).test(n)), `${kind} 模块`);
-      const source = (replacements.get(name) ?? a.entry(name).bytes).toString();
-      const result = transformRuntime(source, kind);
-      replacements.set(name, result.bytes); changes.push(...result.edits);
+        new RegExp('^webview/assets/app-' + kind + '-[^/]+\\.js$').test(n)), kind + ' 模块');
+      put(name, transformRuntime((replacements.get(name) ?? a.entry(name).bytes).toString(), kind, enabled));
     }
   }
-  const bytes = rewriteArchive(original, replacements);
+  const bytes = replacements.size ? rewriteArchive(original, replacements) : original;
   const verified = readArchive(bytes);
   for (const name of replacements.keys()) {
     const e = verified.entry(name);
-    check(sha256(e.bytes) === e.item.integrity.hash, `候选摘要验证失败：${name}`);
+    check(sha256(e.bytes) === e.item.integrity.hash, '候选摘要验证失败：' + name);
   }
   return { bytes, report: { status: 'ready', patchVersion: runtime ? 5 : 2, version: pkg.version,
     sourceSha256: sha256(original), candidateSha256: sha256(bytes), archiveSize: bytes.length,
-    modules: [...replacements.keys()], changes: changes.map(e => e.name) } };
+    modules: [...replacements.keys()], changes: changes.map(e => e.name), ...(runtime ? { selectedOptions: options } : {}) } };
 }
 // 原位安装/恢复保留旧算法，确保已安装 v0.3 的配套哈希仍可验证。
 export function buildPatch(original) { return buildArchive(original, false); }
-export function buildOptimizedPatch(original) { return buildArchive(original, true); }
-export function buildOptimizedInstallation(original, originalExe) {
-  const candidate = buildOptimizedPatch(original), executable = updateExecutable(originalExe, original, candidate.bytes);
+export function buildOptimizedPatch(original, selected) { return buildArchive(original, true, selected); }
+export function buildOptimizedInstallation(original, originalExe, selected) {
+  const candidate = buildOptimizedPatch(original, selected), executable = updateExecutable(originalExe, original, candidate.bytes);
   return { asar: candidate.bytes, exe: executable.bytes, report: { ...candidate.report,
     sourceExeSha256: sha256(originalExe), candidateExeSha256: sha256(executable.bytes),
     headerBeforeSha256: executable.before, headerAfterSha256: executable.after } };
@@ -268,14 +287,15 @@ export function inspect(target) {
   return buildInstallation(original, originalExe).report;
 }
 // 两种交付形式共用同一候选。升级前备份只作回滚，不覆盖 v0.3 原始备份。
-export function resolveUpgrade(target) {
+export function resolveUpgrade(target, selected, forRestore = false) {
   target = fs.realpathSync(target);
   check(path.basename(target) === 'app.asar' && path.basename(path.dirname(target)) === 'resources', '请选择 resources/app.asar。');
   const exe = executablePath(target), backup = target + UPGRADE_BACKUP_SUFFIX, exeBackup = exe + UPGRADE_BACKUP_SUFFIX;
+  const selectionFile = path.join(path.dirname(exe), SELECTION_FILE);
   check(!fs.existsSync(path.join(path.dirname(exe), 'codex-optimized-copy.json')), '请选择来源安装，不要原位修改带清单的优化副本。');
   const oldAsar = fs.existsSync(target + BACKUP_SUFFIX), oldExe = fs.existsSync(exe + BACKUP_SUFFIX);
   check(oldAsar === oldExe, '旧版 EXE/ASAR 备份不完整，请先核对旧版恢复材料。');
-  for (const file of [exe, backup, exeBackup, target + BACKUP_SUFFIX, exe + BACKUP_SUFFIX])
+  for (const file of [exe, backup, exeBackup, selectionFile, target + BACKUP_SUFFIX, exe + BACKUP_SUFFIX])
     check(!fs.existsSync(file) || !fs.lstatSync(file).isSymbolicLink(), `不支持链接文件：${file}`);
   const currentAsar = fs.readFileSync(target), currentExe = fs.readFileSync(exe);
   const beforeAsar = fs.existsSync(backup) ? fs.readFileSync(backup) : currentAsar;
@@ -291,22 +311,30 @@ export function resolveUpgrade(target) {
     check(originalPair || legacyPair, '升级前文件不是完整原版或 v0.3 配套版本，拒绝覆盖。');
     beforeState = legacyPair ? 'patched' : 'ready';
   } else {
-    const base = modules(original);
+    const base = modules(original, false);
     if (base.a.entry(base.main).bytes.includes(Buffer.from(MARKER))) beforeState = 'patched';
   }
-  const candidate = buildOptimizedInstallation(original, originalExe);
   const beforeHashes = [sha256(beforeAsar), sha256(beforeExe)], currentHashes = [sha256(currentAsar), sha256(currentExe)];
+  const atBaseline = currentHashes.every((hash, i) => hash === beforeHashes[i]);
+  const selectionText = fs.existsSync(selectionFile) ? fs.readFileSync(selectionFile, 'utf8') : null;
+  const saved = selectionText === null ? null : JSON.parse(selectionText);
+  if (saved) check(saved.format === 1 && Array.isArray(saved.options) && JSON.stringify(saved.beforeHashes) === JSON.stringify(beforeHashes), '优化选项记录与配套备份不匹配，请核对 codex-lite-install.json。');
+  const installedOptions = normalizeOptions(saved?.options);
+  const options = forRestore ? installedOptions : normalizeOptions(selected);
+  const candidate = buildOptimizedInstallation(original, originalExe, options);
+  const installed = atBaseline || JSON.stringify(options) === JSON.stringify(installedOptions) ? candidate : buildOptimizedInstallation(original, originalExe, installedOptions);
   const afterHashes = [candidate.report.candidateSha256, candidate.report.candidateExeSha256];
-  check(currentHashes.every((hash, i) => hash === beforeHashes[i] || hash === afterHashes[i]), '安装文件已有未知后续修改，拒绝覆盖；请核对应用更新或其他补丁。');
-  const state = currentHashes.every((hash, i) => hash === beforeHashes[i]) ? beforeState :
-    currentHashes.every((hash, i) => hash === afterHashes[i]) ? 'upgraded' : 'partial';
+  const installedHashes = [installed.report.candidateSha256, installed.report.candidateExeSha256];
+  check(currentHashes.every((hash, i) => hash === beforeHashes[i] || hash === installedHashes[i]), '安装文件已有未知后续修改，拒绝覆盖；请核对应用更新、其他补丁或选项记录缺失。');
+  const state = atBaseline ? beforeState : currentHashes.every((hash, i) => hash === installedHashes[i]) ? 'upgraded' : 'partial';
   const backupsComplete = fs.existsSync(backup) && fs.existsSync(exeBackup);
   check(state !== 'partial' || backupsComplete, '安装处于半完成状态且缺少配套回滚备份。');
   return { target, exe, backup, exeBackup, candidate, asarInput, exeInput, beforeAsar, beforeExe,
-    beforeHashes, currentHashes, afterHashes, state, beforeState, backupsComplete };
+    beforeHashes, currentHashes, afterHashes, state, beforeState, backupsComplete, installedOptions,
+    selectionFile, selectionText, matchesSelection: currentHashes.every((hash, i) => hash === afterHashes[i]) };
 }
-export function sourceForCopy(target) {
-  const result = resolveUpgrade(target);
+export function sourceForCopy(target, selected) {
+  const result = resolveUpgrade(target, selected);
   check(result.state !== 'partial', '来源安装处于半完成状态，请先执行原位回滚后再生成副本。');
   return result;
 }

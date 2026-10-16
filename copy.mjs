@@ -2,7 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { sourceForCopy, VERSION } from './patch.mjs';
+import { sourceForCopy, VERSION, SELECTION_FILE } from './patch.mjs';
+import { parseOptionsArgument } from './options.mjs';
 
 const TOOL_ROOT = path.dirname(fileURLToPath(import.meta.url));
 export const MANIFEST = 'codex-optimized-copy.json';
@@ -41,6 +42,7 @@ function inventory(root) {
   function visit(directory, prefix = '') {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       const relative = prefix + entry.name, full = path.join(directory, entry.name);
+      if ([SELECTION_FILE, SELECTION_FILE + '.tmp'].includes(relative)) continue;
       // 不把旧补丁回滚材料复制到优化版中。
       if (/^(ChatGPT\.exe|resources\/app\.asar)\.(before-perf-v\d+|perf-v\d+\.tmp|before-lite-v\d+|lite-v\d+\.tmp)$/.test(relative)) continue;
       check(!fs.lstatSync(full).isSymbolicLink(), `来源含链接，暂不支持复制：${relative}`);
@@ -52,8 +54,8 @@ function inventory(root) {
   for (const name of [MANIFEST, ...LAUNCH_FILES]) check(!result.some(f => f.relative === name), `来源包含保留文件名：${name}`);
   return result;
 }
-function prepare(target) {
-  const source = sourceRoot(target), prepared = sourceForCopy(source.target), files = inventory(source.root);
+function prepare(target, selected) {
+  const source = sourceRoot(target), prepared = sourceForCopy(source.target, selected), files = inventory(source.root);
   for (const file of files) {
     if (file.relative === 'ChatGPT.exe') file.source = prepared.exeInput;
     if (file.relative === 'resources/app.asar') file.source = prepared.asarInput;
@@ -65,10 +67,10 @@ function report(source) {
     useVerifiedBackups: source.asarInput !== source.target, fileCount: source.files.length,
     estimatedBytes: source.files.reduce((sum, f) => sum + f.size, 0), ...source.candidate.report, status: 'copy-ready' };
 }
-export function inspectSource(target) { return report(prepare(target)); }
+export function inspectSource(target, selected) { return report(prepare(target, selected)); }
 
-export function createCopy(target, destination) {
-  const source = prepare(target), output = physicalDestination(destination), stage = output + '.building';
+export function createCopy(target, destination, selected) {
+  const source = prepare(target, selected), output = physicalDestination(destination), stage = output + '.building';
   check(!inside(source.root, output) && !inside(output, source.root), '副本目录与来源目录不能相同或互相包含。');
   check(!inside(source.root, stage) && !inside(stage, source.root), '临时生成目录与来源目录重叠。');
   check(!fs.existsSync(output) && !fs.existsSync(stage), '目标或 .building 目录已存在，请选择一个新的副本目录。');
@@ -101,7 +103,7 @@ export function createCopy(target, destination) {
     fs.copyFileSync(from, to, fs.constants.COPYFILE_EXCL);
     records.push({ path: name, size: fs.statSync(to).size, sha256: hashFile(to) });
   }
-  const manifest = { format: 1, toolVersion: '0.6.0', appVersion: VERSION, createdAt: new Date().toISOString(),
+  const manifest = { format: 1, toolVersion: '0.7.0', appVersion: VERSION, createdAt: new Date().toISOString(), selectedOptions: source.candidate.report.selectedOptions,
     sourceRoot: source.root, sourceState: source.state, sourceAsarSha256: source.candidate.report.sourceSha256,
     sourceExeSha256: source.candidate.report.sourceExeSha256, candidateAsarSha256: source.candidate.report.candidateSha256,
     candidateExeSha256: source.candidate.report.candidateExeSha256, launchArguments: ['--disable-features=NonBlockingOsClipboardReads'],
@@ -125,10 +127,12 @@ export function verifyCopy(directory) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    const [command, input, output] = process.argv.slice(2);
-    check(['inspect', 'create', 'verify'].includes(command) && input && process.argv.length === (command === 'create' ? 5 : 4),
-      '用法：node copy.mjs inspect <app.asar> | create <app.asar> <新副本目录> | verify <副本目录>');
-    const result = command === 'inspect' ? inspectSource(input) : command === 'create' ? createCopy(input, output) : verifyCopy(input);
+    const args = process.argv.slice(2), [command, input, output] = args;
+    const size = command === 'create' ? 3 : 2;
+    check(['inspect', 'create', 'verify'].includes(command) && input && [size, size + 1].includes(args.length) && !(command === 'verify' && args.length !== size),
+      '用法：node copy.mjs inspect <app.asar> [--options=id,id] | create <app.asar> <新副本目录> [--options=id,id] | verify <副本目录>');
+    const selected = parseOptionsArgument(args[size]);
+    const result = command === 'inspect' ? inspectSource(input, selected) : command === 'create' ? createCopy(input, output, selected) : verifyCopy(input);
     console.log(JSON.stringify(result, null, 2));
   } catch (error) { console.error(`ERROR: ${error.message}`); process.exitCode = 1; }
 }
