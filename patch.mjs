@@ -5,11 +5,13 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { executableIntegrity, headerHash, updateExecutable } from './exe-integrity.mjs';
+import { transformRuntime } from './runtime-patches.mjs';
 
 const acorn = createRequire(import.meta.url)('./vendor/acorn.cjs');
 export const VERSION = '26.928.20755';
 export const MARKER = '/*codex-windows-perf:v2*/';
 export const BACKUP_SUFFIX = '.before-perf-v3';
+export const UPGRADE_BACKUP_SUFFIX = '.before-lite-v5';
 export const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 function check(condition, message) { if (!condition) throw new Error(message); }
 function walk(node, visit) {
@@ -166,18 +168,37 @@ function modules(original) {
     a.entry(n).bytes.includes(Buffer.from('CheckoutPricingWebviewHost'))), '购买模块');
   return { a, pkg, main, checkout };
 }
-export function buildPatch(original) {
+function buildArchive(original, runtime) {
   const { a, pkg, main, checkout } = modules(original);
   const m = transform(a.entry(main).bytes.toString()), c = transformCheckout(a.entry(checkout).bytes.toString());
-  const bytes = rewriteArchive(original, new Map([[main, m.bytes], [checkout, c.bytes]]));
+  const replacements = new Map([[main, m.bytes], [checkout, c.bytes]]), changes = [...m.edits, ...c.edits];
+  if (runtime) {
+    for (const kind of ['main', 'initial', 'shared']) {
+      const name = kind === 'main' ? main : only([...a.entries.keys()].filter(n =>
+        new RegExp(`^webview/assets/app-${kind}-[^/]+\\.js$`).test(n)), `${kind} 模块`);
+      const source = (replacements.get(name) ?? a.entry(name).bytes).toString();
+      const result = transformRuntime(source, kind);
+      replacements.set(name, result.bytes); changes.push(...result.edits);
+    }
+  }
+  const bytes = rewriteArchive(original, replacements);
   const verified = readArchive(bytes);
-  for (const name of [main, checkout]) {
+  for (const name of replacements.keys()) {
     const e = verified.entry(name);
     check(sha256(e.bytes) === e.item.integrity.hash, `候选摘要验证失败：${name}`);
   }
-  return { bytes, report: { status: 'ready', patchVersion: 2, version: pkg.version,
+  return { bytes, report: { status: 'ready', patchVersion: runtime ? 5 : 2, version: pkg.version,
     sourceSha256: sha256(original), candidateSha256: sha256(bytes), archiveSize: bytes.length,
-    modules: [main, checkout], changes: [...m.edits, ...c.edits].map(e => e.name) } };
+    modules: [...replacements.keys()], changes: changes.map(e => e.name) } };
+}
+// 原位安装/恢复保留旧算法，确保已安装 v0.3 的配套哈希仍可验证。
+export function buildPatch(original) { return buildArchive(original, false); }
+export function buildOptimizedPatch(original) { return buildArchive(original, true); }
+export function buildOptimizedInstallation(original, originalExe) {
+  const candidate = buildOptimizedPatch(original), executable = updateExecutable(originalExe, original, candidate.bytes);
+  return { asar: candidate.bytes, exe: executable.bytes, report: { ...candidate.report,
+    sourceExeSha256: sha256(originalExe), candidateExeSha256: sha256(executable.bytes),
+    headerBeforeSha256: executable.before, headerAfterSha256: executable.after } };
 }
 function executablePath(target) { return path.join(path.dirname(path.dirname(target)), 'ChatGPT.exe'); }
 export function buildInstallation(original, originalExe) {
@@ -210,17 +231,47 @@ export function inspect(target) {
   check(executableIntegrity(originalExe).hash === headerHash(original), 'EXE 与 ASAR 校验不匹配。若安装过旧版补丁，请先恢复原 ASAR。');
   return buildInstallation(original, originalExe).report;
 }
-// 副本模式仅返回经过验证的原文件来源，不写入原安装或其备份。
-export function sourceForCopy(target) {
-  const exe = executablePath(target);
-  if (fs.existsSync(target + BACKUP_SUFFIX) && fs.existsSync(exe + BACKUP_SUFFIX)) {
-    const pair = savedPair(target), state = pairState(target, pair);
-    check(state !== 'partial', '来源安装处于半完成状态，请先用旧版恢复命令恢复后再生成副本。');
-    return { candidate: pair.candidate, asarInput: pair.backup, exeInput: pair.exeBackup, state };
+// 两种交付形式共用同一候选。升级前备份只作回滚，不覆盖 v0.3 原始备份。
+export function resolveUpgrade(target) {
+  target = fs.realpathSync(target);
+  check(path.basename(target) === 'app.asar' && path.basename(path.dirname(target)) === 'resources', '请选择 resources/app.asar。');
+  const exe = executablePath(target), backup = target + UPGRADE_BACKUP_SUFFIX, exeBackup = exe + UPGRADE_BACKUP_SUFFIX;
+  check(!fs.existsSync(path.join(path.dirname(exe), 'codex-optimized-copy.json')), '请选择来源安装，不要原位修改带清单的优化副本。');
+  const oldAsar = fs.existsSync(target + BACKUP_SUFFIX), oldExe = fs.existsSync(exe + BACKUP_SUFFIX);
+  check(oldAsar === oldExe, '旧版 EXE/ASAR 备份不完整，请先核对旧版恢复材料。');
+  for (const file of [exe, backup, exeBackup, target + BACKUP_SUFFIX, exe + BACKUP_SUFFIX])
+    check(!fs.existsSync(file) || !fs.lstatSync(file).isSymbolicLink(), `不支持链接文件：${file}`);
+  const currentAsar = fs.readFileSync(target), currentExe = fs.readFileSync(exe);
+  const beforeAsar = fs.existsSync(backup) ? fs.readFileSync(backup) : currentAsar;
+  const beforeExe = fs.existsSync(exeBackup) ? fs.readFileSync(exeBackup) : currentExe;
+  const asarInput = oldAsar ? target + BACKUP_SUFFIX : fs.existsSync(backup) ? backup : target;
+  const exeInput = oldExe ? exe + BACKUP_SUFFIX : fs.existsSync(exeBackup) ? exeBackup : exe;
+  const original = fs.readFileSync(asarInput), originalExe = fs.readFileSync(exeInput);
+  let beforeState = 'ready';
+  if (oldAsar) {
+    const legacy = buildInstallation(original, originalExe);
+    const originalPair = sha256(beforeAsar) === legacy.report.sourceSha256 && sha256(beforeExe) === legacy.report.sourceExeSha256;
+    const legacyPair = sha256(beforeAsar) === legacy.report.candidateSha256 && sha256(beforeExe) === legacy.report.candidateExeSha256;
+    check(originalPair || legacyPair, '升级前文件不是完整原版或 v0.3 配套版本，拒绝覆盖。');
+    beforeState = legacyPair ? 'patched' : 'ready';
   }
-  return { candidate: buildInstallation(fs.readFileSync(target), fs.readFileSync(exe)), asarInput: target, exeInput: exe, state: 'ready' };
+  const candidate = buildOptimizedInstallation(original, originalExe);
+  const beforeHashes = [sha256(beforeAsar), sha256(beforeExe)], currentHashes = [sha256(currentAsar), sha256(currentExe)];
+  const afterHashes = [candidate.report.candidateSha256, candidate.report.candidateExeSha256];
+  check(currentHashes.every((hash, i) => hash === beforeHashes[i] || hash === afterHashes[i]), '安装文件已有未知后续修改，拒绝覆盖；请核对应用更新或其他补丁。');
+  const state = currentHashes.every((hash, i) => hash === beforeHashes[i]) ? beforeState :
+    currentHashes.every((hash, i) => hash === afterHashes[i]) ? 'upgraded' : 'partial';
+  const backupsComplete = fs.existsSync(backup) && fs.existsSync(exeBackup);
+  check(state !== 'partial' || backupsComplete, '安装处于半完成状态且缺少配套回滚备份。');
+  return { target, exe, backup, exeBackup, candidate, asarInput, exeInput, beforeAsar, beforeExe,
+    beforeHashes, currentHashes, afterHashes, state, beforeState, backupsComplete };
 }
-function requireStopped() {
+export function sourceForCopy(target) {
+  const result = resolveUpgrade(target);
+  check(result.state !== 'partial', '来源安装处于半完成状态，请先执行原位回滚后再生成副本。');
+  return result;
+}
+export function requireStopped() {
   check(process.platform === 'win32', '安装和恢复仅支持 Windows。');
   const result = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
     '$p = @(Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue); if ($p.Count -gt 0) { Write-Output "RUNNING" }'],

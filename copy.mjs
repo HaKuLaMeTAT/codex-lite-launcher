@@ -42,7 +42,7 @@ function inventory(root) {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       const relative = prefix + entry.name, full = path.join(directory, entry.name);
       // 不把旧补丁回滚材料复制到优化版中。
-      if (/^(ChatGPT\.exe|resources\/app\.asar)\.(before-perf-v\d+|perf-v\d+\.tmp)$/.test(relative)) continue;
+      if (/^(ChatGPT\.exe|resources\/app\.asar)\.(before-perf-v\d+|perf-v\d+\.tmp|before-lite-v\d+|lite-v\d+\.tmp)$/.test(relative)) continue;
       check(!fs.lstatSync(full).isSymbolicLink(), `来源含链接，暂不支持复制：${relative}`);
       if (entry.isDirectory()) visit(full, relative + '/');
       else { check(entry.isFile(), `不支持的来源文件：${relative}`); result.push({ relative, source: full, size: fs.statSync(full).size }); }
@@ -101,7 +101,7 @@ export function createCopy(target, destination) {
     fs.copyFileSync(from, to, fs.constants.COPYFILE_EXCL);
     records.push({ path: name, size: fs.statSync(to).size, sha256: hashFile(to) });
   }
-  const manifest = { format: 1, toolVersion: '0.4.0', appVersion: VERSION, createdAt: new Date().toISOString(),
+  const manifest = { format: 1, toolVersion: '0.6.0', appVersion: VERSION, createdAt: new Date().toISOString(),
     sourceRoot: source.root, sourceState: source.state, sourceAsarSha256: source.candidate.report.sourceSha256,
     sourceExeSha256: source.candidate.report.sourceExeSha256, candidateAsarSha256: source.candidate.report.candidateSha256,
     candidateExeSha256: source.candidate.report.candidateExeSha256, launchArguments: ['--disable-features=NonBlockingOsClipboardReads'],
