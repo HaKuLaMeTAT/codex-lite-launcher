@@ -1,7 +1,9 @@
 ﻿param([switch]$SmokeTest, [string]$TargetPath, [string]$ScreenshotPath,
-    [ValidateSet('copy','inplace')][string]$Mode = 'copy', [string]$SelectedOptions = 'all')
+    [ValidateSet('copy','inplace')][string]$Mode = 'copy', [string]$SelectedOptions = 'all',
+    [ValidateRange(1,180)][int]$InactiveMinutes = 5)
 
 $ErrorActionPreference = 'Stop'
+$script:inactiveMinutesExplicit = $PSBoundParameters.ContainsKey('InactiveMinutes')
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -29,7 +31,7 @@ function Find-Installation {
 }
 
 $form = New-Object Windows.Forms.Form
-$form.Text = 'Codex 轻启 v0.8.0'
+$form.Text = 'Codex 轻启 v0.10.0'
 $form.ClientSize = New-Object Drawing.Size(720, 750)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
@@ -73,9 +75,18 @@ $form.Controls.Add($outputBrowse)
 # Windows PowerShell 5.1 的 ConvertFrom-Json 将数组作为单个管道对象输出，直接赋值避免再包一层。
 $optionDefinitions = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'options.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $optionLabel = New-Object Windows.Forms.Label
-$optionLabel.Text = '性能优化项（默认全选，执行时自动检查所选项）'
-$optionLabel.SetBounds(22, 236, 675, 24)
+$optionLabel.Text = '性能优化项（默认全选）'
+$optionLabel.SetBounds(22, 236, 315, 24)
 $form.Controls.Add($optionLabel)
+$retentionLabel = New-Object Windows.Forms.Label
+$retentionLabel.Text = '会话保留（1–180 分钟）'
+$retentionLabel.SetBounds(360, 236, 245, 24)
+$form.Controls.Add($retentionLabel)
+$retentionMinutes = New-Object Windows.Forms.NumericUpDown
+$retentionMinutes.Minimum = 1; $retentionMinutes.Maximum = 180
+$retentionMinutes.Value = $InactiveMinutes
+$retentionMinutes.SetBounds(617, 233, 80, 28)
+$form.Controls.Add($retentionMinutes)
 $optionList = New-Object Windows.Forms.CheckedListBox
 $optionList.CheckOnClick = $true
 $optionList.MultiColumn = $true
@@ -87,6 +98,8 @@ foreach ($option in $optionDefinitions) {
     [void]$optionList.Items.Add($option.label, $checked)
 }
 $form.Controls.Add($optionList)
+$retentionIndex = @($optionDefinitions.id).IndexOf('inactive-thread-unsubscribe')
+$retentionMinutes.Enabled = $optionList.GetItemChecked($retentionIndex)
 
 $checkButton = New-Object Windows.Forms.Button
 $checkButton.Text = '检查来源'
@@ -123,6 +136,8 @@ $form.Controls.Add($note)
 
 $script:worker = $null
 $script:operation = ''
+$script:operationClock = [Diagnostics.Stopwatch]::new()
+$script:operationStatus = ''
 $script:smokeExit = 1
 $timer = New-Object Windows.Forms.Timer
 $timer.Interval = 200
@@ -164,6 +179,7 @@ function Start-Operation([string]$Command) {
             $ids = @($optionList.CheckedIndices | ForEach-Object { $optionDefinitions[$_].id })
             $selection = if ($ids.Count -eq 0) { 'none' } else { $ids -join ',' }
             $info.Arguments += ' --options=' + $selection
+            $info.Arguments += ' --inactive-minutes=' + [int]$retentionMinutes.Value
         }
         $info.UseShellExecute = $false
         $info.CreateNoWindow = $true
@@ -177,8 +193,11 @@ function Start-Operation([string]$Command) {
         # 异步读取管道，避免长输出阻塞；UI 定时器只收取完成结果。
         $script:stdoutTask = $script:worker.StandardOutput.ReadToEndAsync()
         $script:stderrTask = $script:worker.StandardError.ReadToEndAsync()
-        foreach ($control in @($modeBox, $optionList, $location, $browse, $outputPath, $outputBrowse, $checkButton, $applyButton, $restoreButton, $openButton)) { $control.Enabled = $false }
+        foreach ($control in @($modeBox, $optionList, $retentionMinutes, $location, $browse, $outputPath, $outputBrowse, $checkButton, $applyButton, $restoreButton, $openButton)) { $control.Enabled = $false }
         $status.Text = @{ inspect = '正在检查来源…'; create = '正在检查来源、生成并校验副本…'; apply = '正在检查所选优化并原位升级…'; restore = '正在校验并恢复最初基线备份…' }[$Command]
+        $script:operationStatus = $status.Text
+        $script:operationClock.Restart()
+        $details.Text = '正在校验安装文件并计算所选补丁。真实安装包较大，可能需要数分钟；完成后会显示结果。'
         $timer.Start()
     } catch {
         $status.Text = '未执行操作'
@@ -188,12 +207,20 @@ function Start-Operation([string]$Command) {
 }
 
 $timer.Add_Tick({
-    if ($null -eq $script:worker -or -not $script:worker.HasExited) { return }
+    if ($null -eq $script:worker) { return }
+    if (-not $script:worker.HasExited) {
+        $status.Text = $script:operationStatus + ' 已用时 ' + [int]$script:operationClock.Elapsed.TotalSeconds + ' 秒'
+        return
+    }
+    $script:operationClock.Stop()
     $timer.Stop()
     try {
         $output = $script:stdoutTask.Result
         $errorText = $script:stderrTask.Result
-        if ($script:worker.ExitCode -ne 0) { throw $errorText.Trim() }
+        if ($script:worker.ExitCode -ne 0) {
+            $reason = if ([string]::IsNullOrWhiteSpace($errorText)) { '后台进程未返回错误说明。' } else { $errorText.Trim() }
+            throw ('退出码 ' + $script:worker.ExitCode + '：' + $reason)
+        }
         $result = $output | ConvertFrom-Json
         $applyButton.Enabled = $result.status -eq 'copy-ready'
         $openButton.Enabled = $result.status -eq 'copy-created'
@@ -236,6 +263,7 @@ $timer.Add_Tick({
         if ($result.status -ne 'upgrade-restored') {
             $selectionLabel = if ($result.status -in @('upgrade-applied','copy-created')) { '已应用优化' } else { '所选优化' }
             $details.Text += "`r`n${selectionLabel}：$summary"
+            if ($result.selectedOptions -contains 'inactive-thread-unsubscribe') { $details.Text += "`r`n非活跃会话保留：$($result.inactiveMinutes) 分钟；到期后按原有安全检查取消订阅。" }
         }
         if ($SmokeTest) {
             [Console]::WriteLine((@{ status = $result.status; itemCount = $optionList.Items.Count; checkedCount = $optionList.CheckedItems.Count; selectedOptions = $result.selectedOptions } | ConvertTo-Json -Compress))
@@ -251,6 +279,7 @@ $timer.Add_Tick({
         $script:worker = $null
         $location.Enabled = $true; $browse.Enabled = $true; $checkButton.Enabled = $true
         $modeBox.Enabled = $true; $optionList.Enabled = $true
+        $retentionMinutes.Enabled = $optionList.GetItemChecked($retentionIndex)
         $outputPath.Enabled = $modeBox.SelectedIndex -eq 0; $outputBrowse.Enabled = $modeBox.SelectedIndex -eq 0
         if ($ScreenshotPath) {
             $bitmap = New-Object Drawing.Bitmap($form.Width, $form.Height)
@@ -265,9 +294,16 @@ $optionList.Add_ItemCheck({
     param($sender, $eventArgs)
     # 控件刷新可能发出值未变化的 ItemCheck；操作期间也不能覆盖完成结果。
     if ($eventArgs.NewValue -eq $eventArgs.CurrentValue -or $null -ne $script:worker) { return }
+    if ($eventArgs.Index -eq $retentionIndex) { $retentionMinutes.Enabled = $eventArgs.NewValue -eq [Windows.Forms.CheckState]::Checked }
     $applyButton.Enabled = -not [string]::IsNullOrWhiteSpace($location.Text); $openButton.Enabled = $false
     $status.Text = '勾选已更新，可直接执行；执行时自动校验，无需重新检查。'
     $details.Text = '待执行：按当前勾选应用优化。回滚仍恢复最初基线备份。'
+})
+$retentionMinutes.Add_ValueChanged({
+    if ($null -ne $script:worker) { return }
+    $applyButton.Enabled = -not [string]::IsNullOrWhiteSpace($location.Text); $openButton.Enabled = $false
+    $status.Text = '保留时间已更新，可直接执行，无需重新检查。'
+    $details.Text = "待执行：非活跃会话保留 $([int]$retentionMinutes.Value) 分钟。仅在勾选会话取消订阅优化时生效。"
 })
 $location.Add_TextChanged({ $applyButton.Enabled = $null -eq $script:worker -and -not [string]::IsNullOrWhiteSpace($location.Text); $restoreButton.Enabled = $false; $openButton.Enabled = $false })
 $modeBox.Add_SelectedIndexChanged({ Reset-Mode })
@@ -295,6 +331,16 @@ $form.Add_FormClosing({
 $form.Add_Shown({
     Reset-Mode
     if ($TargetPath) { $location.Text = $TargetPath } else { $location.Text = Find-Installation }
+    # 启动时读取既有安装的时限；显式命令行参数优先，回滚仍只使用安装记录。
+    if ($location.Text -and -not $script:inactiveMinutesExplicit) {
+        try {
+            $recordPath = Join-Path (Split-Path (Split-Path (Resolve-Asar $location.Text) -Parent) -Parent) 'codex-lite-install.json'
+            if (Test-Path -LiteralPath $recordPath) {
+                $saved = Get-Content -LiteralPath $recordPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($null -ne $saved.inactiveMinutes -and $saved.inactiveMinutes -ge 1 -and $saved.inactiveMinutes -le 180 -and [int]$saved.inactiveMinutes -eq $saved.inactiveMinutes) { $retentionMinutes.Value = $saved.inactiveMinutes }
+            }
+        } catch { $details.Text = '安装记录读取失败；执行时会重新校验。' }
+    }
     if ($location.Text) { Start-Operation 'inspect' }
     elseif ($SmokeTest) { $form.Close() }
 })

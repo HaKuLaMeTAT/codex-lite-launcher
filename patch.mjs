@@ -5,8 +5,8 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { executableIntegrity, headerHash, updateExecutable } from './exe-integrity.mjs';
-import { transformRuntime, transformInactiveThreads } from './runtime-patches.mjs';
-import { normalizeOptions, selectedEdits } from './options.mjs';
+import { transformRuntime, transformInactiveThreads, transformInactiveViewLease, transformAppToolsLaunch, transformSharedAppTools } from './runtime-patches.mjs';
+import { normalizeOptions, selectedEdits, normalizeInactiveMinutes } from './options.mjs';
 
 const acorn = createRequire(import.meta.url)('./vendor/acorn.cjs');
 export const VERSION = '26.928.20755';
@@ -213,7 +213,8 @@ function verifyLegacy(main, checkout) {
   });
   for (const [name, found] of Object.entries(matches)) only(found, `旧补丁 ${name}`);
 }
-function buildArchive(original, runtime, selected) {
+function buildArchive(original, runtime, selected, revision = 8, inactiveMinutes = 5) {
+  inactiveMinutes = normalizeInactiveMinutes(inactiveMinutes);
   const options = normalizeOptions(selected), enabled = runtime ? selectedEdits(options) : ['avatar', 'hotkey', 'detached', 'menu', 'checkout-pricing', 'checkout-credit'];
   const { a, pkg, main, checkout } = modules(original, enabled.some(id => id.startsWith('checkout-')));
   const mainSource = a.entry(main).bytes.toString();
@@ -231,6 +232,10 @@ function buildArchive(original, runtime, selected) {
     if (checkout) put(checkout, transformCheckout(a.entry(checkout).bytes.toString(), enabled));
   }
   if (runtime) {
+    if (revision >= 7 && options.includes('app-tools-direct-node'))
+      put(main, transformAppToolsLaunch((replacements.get(main) ?? a.entry(main).bytes).toString()));
+    if (revision >= 8 && options.includes('app-tools-shared-host'))
+      put(main, transformSharedAppTools((replacements.get(main) ?? a.entry(main).bytes).toString()));
     const groups = { main: ['batched-pty-output'], initial: ['settled-stream-text', 'coalesced-mcp-inventory'], shared: ['command-output-items', 'cached-highlight-language', 'highlight-timer-cleanup'] };
     for (const [kind, ids] of Object.entries(groups)) {
       if (!ids.some(id => enabled.includes(id))) continue;
@@ -239,9 +244,13 @@ function buildArchive(original, runtime, selected) {
       put(name, transformRuntime((replacements.get(name) ?? a.entry(name).bytes).toString(), kind, enabled));
     }
     if (options.includes('inactive-thread-unsubscribe')) {
+      if (revision >= 6) {
+        const name = only([...a.entries.keys()].filter(n => /^webview\/assets\/app-primary-[^/]+\.js$/.test(n)), '页面租约模块');
+        put(name, transformInactiveViewLease(a.entry(name).bytes.toString()));
+      }
       for (const [kind, pattern] of [['main', /^\.vite\/build\/bootstrap-[^/]+\.js$/], ['renderer', /^webview\/assets\/app-shared-[^/]+\.js$/]]) {
         const name = only([...a.entries.keys()].filter(n => pattern.test(n)), kind + ' 会话管理模块');
-        put(name, transformInactiveThreads((replacements.get(name) ?? a.entry(name).bytes).toString(), kind));
+        put(name, transformInactiveThreads((replacements.get(name) ?? a.entry(name).bytes).toString(), kind, revision >= 8 ? inactiveMinutes : 5));
       }
     }
   }
@@ -251,15 +260,15 @@ function buildArchive(original, runtime, selected) {
     const e = verified.entry(name);
     check(sha256(e.bytes) === e.item.integrity.hash, '候选摘要验证失败：' + name);
   }
-  return { bytes, report: { status: 'ready', patchVersion: runtime ? 5 : 2, version: pkg.version,
+  return { bytes, report: { status: 'ready', patchVersion: runtime ? revision : 2, version: pkg.version,
     sourceSha256: sha256(original), candidateSha256: sha256(bytes), archiveSize: bytes.length,
-    modules: [...replacements.keys()], changes: changes.map(e => e.name), ...(runtime ? { selectedOptions: options } : {}) } };
+    modules: [...replacements.keys()], changes: changes.map(e => e.name), ...(runtime ? { selectedOptions: options, inactiveMinutes: revision >= 8 ? inactiveMinutes : 5 } : {}) } };
 }
 // 原位安装/恢复保留旧算法，确保已安装 v0.3 的配套哈希仍可验证。
 export function buildPatch(original) { return buildArchive(original, false); }
-export function buildOptimizedPatch(original, selected) { return buildArchive(original, true, selected); }
-export function buildOptimizedInstallation(original, originalExe, selected) {
-  const candidate = buildOptimizedPatch(original, selected), executable = updateExecutable(originalExe, original, candidate.bytes);
+export function buildOptimizedPatch(original, selected, revision = 8, inactiveMinutes = 5) { return buildArchive(original, true, selected, revision, inactiveMinutes); }
+export function buildOptimizedInstallation(original, originalExe, selected, revision = 8, inactiveMinutes = 5) {
+  const candidate = buildOptimizedPatch(original, selected, revision, inactiveMinutes), executable = updateExecutable(originalExe, original, candidate.bytes);
   return { asar: candidate.bytes, exe: executable.bytes, report: { ...candidate.report,
     sourceExeSha256: sha256(originalExe), candidateExeSha256: sha256(executable.bytes),
     headerBeforeSha256: executable.before, headerAfterSha256: executable.after } };
@@ -296,7 +305,7 @@ export function inspect(target) {
   return buildInstallation(original, originalExe).report;
 }
 // 两种交付形式共用同一候选。升级前备份只作回滚，不覆盖 v0.3 原始备份。
-export function resolveUpgrade(target, selected, forRestore = false) {
+export function resolveUpgrade(target, selected, forRestore = false, inactiveMinutes = 5) {
   target = fs.realpathSync(target);
   check(path.basename(target) === 'app.asar' && path.basename(path.dirname(target)) === 'resources', '请选择 resources/app.asar。');
   const exe = executablePath(target), backup = target + UPGRADE_BACKUP_SUFFIX, exeBackup = exe + UPGRADE_BACKUP_SUFFIX;
@@ -328,28 +337,41 @@ export function resolveUpgrade(target, selected, forRestore = false) {
   const selectionText = fs.existsSync(selectionFile) ? fs.readFileSync(selectionFile, 'utf8') : null;
   const saved = selectionText === null ? null : JSON.parse(selectionText);
   if (saved) check(saved.format === 1 && Array.isArray(saved.options) && JSON.stringify(saved.beforeHashes) === JSON.stringify(beforeHashes), '优化选项记录与配套备份不匹配，请核对 codex-lite-install.json。');
-  const installedOptions = normalizeOptions(saved?.options ?? UNRECORDED_OPTIONS);
+  let installedOptions = normalizeOptions(saved?.options ?? UNRECORDED_OPTIONS);
+  let installedInactiveMinutes = normalizeInactiveMinutes(saved?.inactiveMinutes ?? 5);
+  const previousInactiveMinutes = normalizeInactiveMinutes(saved?.previousInactiveMinutes ?? 5);
   const options = forRestore ? installedOptions : normalizeOptions(selected);
-  const candidate = buildOptimizedInstallation(original, originalExe, options);
-  const installed = atBaseline || JSON.stringify(options) === JSON.stringify(installedOptions) ? candidate : buildOptimizedInstallation(original, originalExe, installedOptions);
+  const candidate = buildOptimizedInstallation(original, originalExe, options, 8, forRestore ? installedInactiveMinutes : inactiveMinutes);
+  let installedRevision = saved?.revision ?? 5;
+  check([5, 6, 7, 8].includes(installedRevision) && (saved?.previousRevision === undefined || [5, 6, 7, 8].includes(saved.previousRevision)), '不支持的补丁算法版本。');
+  // 旧记录没有算法版本，按 v0.8.0 重建校验；选项相同也不能误用新版哈希。
+  const installed = atBaseline || installedRevision === candidate.report.patchVersion && JSON.stringify(options) === JSON.stringify(installedOptions) && installedInactiveMinutes === candidate.report.inactiveMinutes
+    ? candidate : buildOptimizedInstallation(original, originalExe, installedOptions, installedRevision, installedInactiveMinutes);
   const afterHashes = [candidate.report.candidateSha256, candidate.report.candidateExeSha256];
   const installedHashes = [installed.report.candidateSha256, installed.report.candidateExeSha256];
   // 跨补丁升级的事务记录保留上一组选项；中断时允许“旧补丁/新补丁”配对回滚至同一基线。
   let previousHashes = [];
   if (saved?.previousOptions !== undefined && !currentHashes.every((hash, i) => hash === beforeHashes[i] || hash === installedHashes[i])) {
-    const previous = buildOptimizedInstallation(original, originalExe, normalizeOptions(saved.previousOptions));
+    const previous = buildOptimizedInstallation(original, originalExe, normalizeOptions(saved.previousOptions), saved.previousRevision ?? 5, previousInactiveMinutes);
     previousHashes = [previous.report.candidateSha256, previous.report.candidateExeSha256];
   }
   check(currentHashes.every((hash, i) => hash === beforeHashes[i] || hash === installedHashes[i] || hash === previousHashes[i]), '安装文件已有未知后续修改，拒绝覆盖；请核对应用更新、其他补丁或选项记录缺失。');
-  const state = atBaseline ? beforeState : currentHashes.every((hash, i) => hash === installedHashes[i]) ? 'upgraded' : 'partial';
+  // 事务记录可能先于文件替换落盘；完整旧配套仍可直接重试，不能当作混合安装。
+  const atPrevious = previousHashes.length === 2 && currentHashes.every((hash, i) => hash === previousHashes[i]);
+  if (atPrevious) {
+    installedOptions = normalizeOptions(saved.previousOptions);
+    installedRevision = saved.previousRevision ?? 5;
+    installedInactiveMinutes = previousInactiveMinutes;
+  }
+  const state = atBaseline ? beforeState : atPrevious || currentHashes.every((hash, i) => hash === installedHashes[i]) ? 'upgraded' : 'partial';
   const backupsComplete = fs.existsSync(backup) && fs.existsSync(exeBackup);
   check(state !== 'partial' || backupsComplete, '安装处于半完成状态且缺少配套回滚备份。');
   return { target, exe, backup, exeBackup, candidate, asarInput, exeInput, beforeAsar, beforeExe,
-    beforeHashes, currentHashes, afterHashes, state, beforeState, backupsComplete, installedOptions,
+    beforeHashes, currentHashes, afterHashes, state, beforeState, backupsComplete, installedOptions, installedRevision, installedInactiveMinutes,
     selectionFile, selectionText, matchesSelection: currentHashes.every((hash, i) => hash === afterHashes[i]) };
 }
-export function sourceForCopy(target, selected) {
-  const result = resolveUpgrade(target, selected);
+export function sourceForCopy(target, selected, inactiveMinutes) {
+  const result = resolveUpgrade(target, selected, false, inactiveMinutes);
   check(result.state !== 'partial', '来源安装处于半完成状态，请先执行原位回滚后再生成副本。');
   return result;
 }

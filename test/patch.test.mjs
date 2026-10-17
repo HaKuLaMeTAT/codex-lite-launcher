@@ -4,15 +4,18 @@ import vm from 'node:vm';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { transform, transformCheckout, buildPatch, buildOptimizedPatch, readArchive, sha256, VERSION, BACKUP_SUFFIX, install, restore, inspect, sourceForCopy } from '../patch.mjs';
-import { transformRuntime, transformInactiveThreads } from '../runtime-patches.mjs';
+import { transform, transformCheckout, buildPatch, buildOptimizedPatch, readArchive, sha256, VERSION, BACKUP_SUFFIX, install, restore, inspect, sourceForCopy, buildOptimizedInstallation } from '../patch.mjs';
+import { transformRuntime, transformInactiveThreads, transformInactiveViewLease, transformAppToolsLaunch, transformSharedAppTools } from '../runtime-patches.mjs';
 import { inspectUpgrade, applyUpgrade, restoreUpgrade } from '../inplace.mjs';
 import { UPGRADE_BACKUP_SUFFIX, rewriteArchive } from '../patch.mjs';
 import { executableIntegrity, headerHash, updateExecutable } from '../exe-integrity.mjs';
 import { createCopy, inspectSource, verifyCopy, hashFile, MANIFEST } from '../copy.mjs';
-import { OPTIONS, normalizeOptions, parseOptionsArgument } from '../options.mjs';
+import { OPTIONS, normalizeOptions, parseOptionsArgument, parsePatchArguments } from '../options.mjs';
 import { SELECTION_FILE, UNRECORDED_OPTIONS } from '../patch.mjs';
 import acorn from '../vendor/acorn.cjs';
+import http from 'node:http';
+import crypto from 'node:crypto';
+import { createSharedAppToolsHost, sharedAppToolsConfig } from '../app-tools-host.mjs';
 
 function exeFixture(asar) {
   const exe = Buffer.alloc(0x800);
@@ -36,6 +39,24 @@ function exeFixture(asar) {
   exe.write(json, base + 256);
   return exe;
 }
+
+const appToolsFactory = `async function appTools({useWsl,resourcesPath}) {
+ if(!pipe)return fail('missing-pipe');
+ const {mcpServers:{codex_app:config}}=definition;
+ const env={...config.env}, node=runtime;
+ if(node!=null)env.CODEX_MCP_NODE_PATH=node;
+ if(useWsl){if(node==null)return fail('missing-windows-runtime');config.command='/bin/sh';config.args=['-c','wsl-launch']}
+ return {...config,command:process.platform==='win32'?config.command:resourcesPath+'/'+config.command,cwd:useWsl?'/':resourcesPath,enabled:false,env};
+}`;
+
+const sharedAppTools = `
+async function nativePipe({callTool,listTools,readBrowserAccess,prepareTaskWorkspace}) {
+ server.setMessageCallback(callTool);return {pipePath:'pipe',verifyingIdentity:'identity',dispose:async()=>server.close()};
+}
+function catalog(entries){return entries.flatMap(e=>e.type==='namespace'?e.tools.map(t=>({name:t.name,namespace:e.name,inputSchema:t.inputSchema,description:t.description,annotations:e.name==='codex_app'&&t.name==='send_message_to_thread'?{destructiveHint:true}:undefined})):[])}
+async function startPipe(options){return nativePipe({callTool:options.callTool,listTools:options.listTools,readBrowserAccess:options.readBrowserAccess,prepareTaskWorkspace:options.prepareTaskWorkspace})}
+async function writePlugin(connection,config,useWsl){const options={useWsl};delete config.env?.CODEX_MCP_NODE_PATH;await connection.sendAppServerRequest('config/batchWrite',{value:JSON.stringify({mcpServers:{codex_app:config}})});}
+`;
 
 const main = `// 中文：检查字符处理
 class Avatar {
@@ -135,12 +156,20 @@ class Lifecycle {
  unsubscribeInactiveConversation(id){this.resumeState='needs_resume';return this.sendRequest('thread/unsubscribe',{threadId:id})}
 }`;
 
+// 保留 React 编译缓存形状，验证同一个 lease 在切换状态时不会命中旧缓存。
+const pageLease = `function page({view,active}) {
+ const hidden={"data-app-shell-active-page":active,content:view.element};
+ if(cache[0]!==view.lease){cache[1]={children:[view.lease,hidden]};cache[0]=view.lease}
+ return cache[1];
+}`;
+
 function fixture(version = VERSION) {
   const files = new Map([
     ['package.json', JSON.stringify({ name: 'openai-codex-electron', version })],
-    ['.vite/build/main-renamed.js', main], ['webview/assets/webview-page-renamed.js', checkout],
+    ['.vite/build/main-renamed.js', main + appToolsFactory + sharedAppTools], ['webview/assets/webview-page-renamed.js', checkout],
     ['webview/assets/app-initial-renamed.js', initial], ['webview/assets/app-shared-renamed.js', shared + lifecycle],
     ['.vite/build/bootstrap-renamed.js', lifecycle],
+    ['webview/assets/app-primary-renamed.js', pageLease],
     ['unrelated.txt', 'preserve custom screenshot patch and settings'],
   ]);
   const header = { files: {} }, data = [];
@@ -287,14 +316,15 @@ test('independent copy uses original or verified backups, preserves source and r
   }
 });
 
-test('real ASAR: five modules, lifecycle scheduling, packed files and external metadata verify', {
+test('real ASAR: six modules, lifecycle scheduling, packed files and external metadata verify', {
   skip: !process.env.CODEX_TEST_ASAR,
 }, () => {
-  const source = sourceForCopy(process.env.CODEX_TEST_ASAR);
+  const minutes = Number(process.env.CODEX_TEST_INACTIVE_MINUTES ?? 5);
+  const source = sourceForCopy(process.env.CODEX_TEST_ASAR, undefined, minutes);
   const original = fs.readFileSync(source.asarInput), result = { bytes: source.candidate.asar, report: source.candidate.report };
-  assert.equal(result.report.patchVersion, 5);
-  assert.equal(result.report.modules.length, 5);
-  assert.equal(result.report.changes.length, 14);
+  assert.equal(result.report.patchVersion, 8);
+  assert.equal(result.report.modules.length, 6);
+  assert.equal(result.report.changes.length, 17);
   verifyContents(original, result.bytes, result.report.modules);
   const originalExe = fs.readFileSync(source.exeInput);
   const resource = executableIntegrity(originalExe), patchedExe = updateExecutable(originalExe, original, result.bytes).bytes;
@@ -303,17 +333,24 @@ test('real ASAR: five modules, lifecycle scheduling, packed files and external m
   assert.ok(originalExe.subarray(resource.start + 64).equals(patchedExe.subarray(resource.start + 64)));
   assert.throws(() => buildPatch(result.bytes), /已包含/);
   const archive = readArchive(original), output = readArchive(result.bytes);
+  const primary = result.report.modules.find(n => /app-primary-/.test(n));
+  const primarySource = archive.entry(primary).bytes.toString();
+  const leased = transformInactiveViewLease(primarySource).bytes.toString();
+  assert.equal(output.entry(primary).bytes.toString(), leased);
+  assert.equal(leased.replace(/\/\*codex-lite-view-lease:v1\*\/\(\w+\?(\w+\.lease):null\)/g, '$1'), primarySource);
+
   for (const name of result.report.modules.filter(n => /bootstrap-|app-shared-/.test(n))) {
     const input = archive.entry(name).bytes.toString();
-    const patched = transformInactiveThreads(input, 'test').bytes.toString();
-    assert.equal(patched.replace('/*codex-lite-inactive:v1*/300000', '108e5'), input);
-    assert.ok(output.entry(name).bytes.includes(Buffer.from('/*codex-lite-inactive:v1*/300000')));
-    verifyRealLifecycle(patched);
+    const marker = '/*codex-lite-inactive:v1*/' + minutes * 60000;
+    const patched = transformInactiveThreads(input, 'test', minutes).bytes.toString();
+    assert.equal(patched.replace(marker, '108e5'), input);
+    assert.ok(output.entry(name).bytes.includes(Buffer.from(marker)));
+    verifyRealLifecycle(patched, minutes * 60000);
   }
 });
 
 // 在 VM 中运行真实包的候选选择/定时方法；不向正在运行的后端发送任何请求。
-function verifyRealLifecycle(source) {
+function verifyRealLifecycle(source, ttlMs) {
   let owner, ttl, capacity, ephemeral;
   function visit(node, fields = false) {
     if (!node || typeof node !== 'object') return;
@@ -327,7 +364,7 @@ function verifyRealLifecycle(source) {
   // 只取目标类的词法依赖，避免同模块其他 ttlMs 日志字段覆盖名称。
   assert.ok(owner); visit(owner, true);
   assert.ok(owner && ttl && capacity && ephemeral);
-  const Manager = vm.runInNewContext('(' + source.slice(owner.start, owner.end) + ')', { [ttl]: 300000, [capacity]: 10, [ephemeral]: c => c.ephemeral === true });
+  const Manager = vm.runInNewContext('(' + source.slice(owner.start, owner.end) + ')', { [ttl]: ttlMs, [capacity]: 10, [ephemeral]: c => c.ephemeral === true });
   const manager = Object.create(Manager.prototype), states = new Map();
   manager.inactiveOwnerConversationSinceById = new Map(); manager.inactiveOwnerConversationRetryAtById = new Map();
   manager.unsubscribingConversationIds = new Set();
@@ -339,13 +376,14 @@ function verifyRealLifecycle(source) {
   }
   states.get('visible').visible = true; states.get('followers').followers = true; states.get('keep').keep = true;
   states.get('unowned').owned = false; states.get('resuming').resumeState = 'resuming';
-  manager.inactiveOwnerConversationRetryAtById.set('retry', 601000); manager.unsubscribingConversationIds.add('unsubscribing');
-  assert.equal(manager.getNextCheckAtMs(300999), 301000);
-  assert.deepEqual(Array.from(manager.getInactiveOwnerConversationIdsToUnsubscribe(300999)), []);
-  assert.deepEqual(Array.from(manager.getInactiveOwnerConversationIdsToUnsubscribe(301000)), ['idle']);
+  const expiry = ttlMs + 1000, retry = ttlMs * 2 + 1000;
+  manager.inactiveOwnerConversationRetryAtById.set('retry', retry); manager.unsubscribingConversationIds.add('unsubscribing');
+  assert.equal(manager.getNextCheckAtMs(expiry - 1), expiry);
+  assert.deepEqual(Array.from(manager.getInactiveOwnerConversationIdsToUnsubscribe(expiry - 1)), []);
+  assert.deepEqual(Array.from(manager.getInactiveOwnerConversationIdsToUnsubscribe(expiry)), ['idle']);
   states.get('idle').visible = true;
-  assert.deepEqual(Array.from(manager.getInactiveOwnerConversationIdsToUnsubscribe(301000)), []);
-  assert.equal(manager.getNextCheckAtMs(301000), 601000);
+  assert.deepEqual(Array.from(manager.getInactiveOwnerConversationIdsToUnsubscribe(expiry)), []);
+  assert.equal(manager.getNextCheckAtMs(expiry), retry);
 }
 
 test('in-place upgrade and rollback preserve original/legacy pairs and support copied delivery', () => {
@@ -406,6 +444,7 @@ test('in-place interrupted replacement can roll back and preflight failures neve
     assert.equal(fs.existsSync(target + UPGRADE_BACKUP_SUFFIX), false);
     let checks = 0;
     assert.throws(() => applyUpgrade(target, () => { if (++checks === 2) throw Error('running again'); }), /running again/);
+    assert.equal(fs.existsSync(path.join(directory, SELECTION_FILE)), false);
     assert.deepEqual([target, exe].map(hashFile), before);
     fs.renameSync = (from, to) => { if (to === exe) throw Error('injected'); return rename(from, to); };
     assert.throws(() => applyUpgrade(target, () => {}), /替换未完成.*injected/);
@@ -625,25 +664,28 @@ test('runtime transforms reject incomplete, duplicate and already patched module
     assert.throws(() => transformRuntime(source + '\n{' + source + '\n}', kind), /唯一匹配/);
   }
   const original = fixture(), result = buildOptimizedPatch(original);
-  assert.equal(result.report.modules.length, 5); assert.equal(result.report.changes.length, 14);
+  assert.equal(result.report.modules.length, 6); assert.equal(result.report.changes.length, 17);
   verifyContents(original, result.bytes, result.report.modules);
 });
 
 test('inactive thread retention changes only TTL and preserves eligible-thread boundaries', () => {
   for (const source of [lifecycle, lifecycle.replace('var retention=108e5;', 'var retention;retention=108e5;')]) {
-    const result = transformInactiveThreads(source, 'main').bytes.toString();
-    assert.equal(result.replace('/*codex-lite-inactive:v1*/300000', '108e5'), source);
+    for (const minutes of [1, 5, 15, 180]) {
+    const ttl = minutes * 60000;
+    const result = transformInactiveThreads(source, 'main', minutes).bytes.toString();
+    assert.equal(result.replace('/*codex-lite-inactive:v1*/' + ttl, '108e5'), source);
     const Manager = vm.runInNewContext(result + ';Lifecycle'), manager = new Manager();
     for (const id of ['idle', 'visible', 'follower', 'running', 'unowned']) manager.entries.set(id, 1000);
     manager.owned = new Set(['idle', 'visible', 'follower', 'running']);
     manager.active.add('visible'); manager.followers.add('follower'); manager.pinned.add('running');
-    assert.equal(manager.getNextCheckAtMs(), 301000);
-    assert.deepEqual(Array.from(manager.getInactiveOwnerConversationIdsToUnsubscribe(300999)), []);
-    assert.deepEqual(Array.from(manager.getInactiveOwnerConversationIdsToUnsubscribe(301000)), ['idle']);
+    assert.equal(manager.getNextCheckAtMs(), 1000 + ttl);
+    assert.deepEqual(Array.from(manager.getInactiveOwnerConversationIdsToUnsubscribe(999 + ttl)), []);
+    assert.deepEqual(Array.from(manager.getInactiveOwnerConversationIdsToUnsubscribe(1000 + ttl)), ['idle']);
     manager.active.add('idle');
-    assert.deepEqual(Array.from(manager.getInactiveOwnerConversationIdsToUnsubscribe(600000)), []);
+    assert.deepEqual(Array.from(manager.getInactiveOwnerConversationIdsToUnsubscribe(ttl * 2)), []);
     assert.equal(manager.getNextCheckAtMs(), null);
     assert.throws(() => transformInactiveThreads(result, 'main'), /已包含/);
+    }
   }
   assert.throws(() => transformInactiveThreads('', 'main'), /唯一匹配/);
   assert.throws(() => transformInactiveThreads(lifecycle.replace('108e5', '3600000'), 'main'), /3 小时/);
@@ -697,8 +739,11 @@ test('successive upgrades reuse one baseline and recover interrupted old-to-new 
       fs.renameSync = (from, to) => { if (to === failingTarget) throw Error('upgrade interrupted'); return rename(from, to); };
       assert.throws(() => applyUpgrade(target, () => {}), /upgrade interrupted/);
       fs.renameSync = rename;
-      assert.equal(inspectUpgrade(target).state, 'partial');
-      assert.throws(() => applyUpgrade(target, () => {}), /半完成/);
+      assert.equal(inspectUpgrade(target).state, failingTarget === target ? 'upgraded' : 'partial');
+      if (failingTarget === target) {
+        applyUpgrade(target, () => {});
+        assert.equal(inspectUpgrade(target).matchesSelection, true);
+      } else assert.throws(() => applyUpgrade(target, () => {}), /半完成/);
       restoreUpgrade(target, () => {});
       assert.deepEqual([target, exe].map(hashFile), baseline);
       assert.deepEqual(backupPaths.map(file => fs.statSync(file).mtimeMs), backupTimes);
@@ -710,4 +755,217 @@ test('successive upgrades reuse one baseline and recover interrupted old-to-new 
     assert.ok(!relative.startsWith('..') && !path.isAbsolute(relative) && relative.startsWith('codex-perf-test-'));
     fs.rmSync(directory, { recursive: true, force: true });
   }
+});
+
+
+test('hidden cached pages release the lease and returning pages reacquire it', () => {
+  const result = transformInactiveViewLease(pageLease).bytes.toString();
+  const page = vm.runInNewContext(result + ';page', {cache: []});
+  const lease = {}, element = {}, view = {lease, element};
+  assert.equal(page({view,active:true}).children[0], lease);
+  const hidden = page({view,active:false});
+  assert.equal(hidden.children[0], null);
+  assert.equal(hidden.children[1].content, element);
+  assert.equal(page({view,active:false}), hidden);
+  assert.equal(page({view,active:true}).children[0], lease);
+  assert.throws(() => transformInactiveViewLease(result), /已包含/);
+  assert.throws(() => transformInactiveViewLease(''), /唯一匹配/);
+  assert.throws(() => transformInactiveViewLease(pageLease.replaceAll('lease', 'changed')), /唯一匹配/);
+  assert.throws(() => transformInactiveViewLease(pageLease + pageLease.replace('function page', 'function other')), /唯一匹配/);
+  const archive = fixture();
+  const selected = buildOptimizedPatch(archive, ['inactive-thread-unsubscribe']);
+  assert.ok(selected.report.modules.some(n => n.includes('app-primary-')));
+  assert.equal(readArchive(buildOptimizedPatch(archive, []).bytes).entry('webview/assets/app-primary-renamed.js').bytes.toString(), pageLease);
+});
+
+
+test('0.8.x and 0.9.x upgrades reuse baseline and recover cross-revision interruption', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-perf-test-'));
+  const target = path.join(directory, 'resources', 'app.asar'), exe = path.join(directory, 'ChatGPT.exe');
+  const rename = fs.renameSync;
+  try {
+    fs.mkdirSync(path.dirname(target));
+    const original = fixture(), originalExe = exeFixture(original), options = OPTIONS.map(o => o.id);
+    const baseline = [sha256(original), sha256(originalExe)];
+    fs.writeFileSync(target + UPGRADE_BACKUP_SUFFIX, original);
+    fs.writeFileSync(exe + UPGRADE_BACKUP_SUFFIX, originalExe);
+    const backupTimes = [target, exe].map(p => fs.statSync(p + UPGRADE_BACKUP_SUFFIX).mtimeMs);
+    for (const [revision, failingTarget] of [5, 6, 7].flatMap(revision => [null, target, exe].map(target => [revision, target]))) {
+      const oldOptions = options.filter(id => id !== 'app-tools-shared-host' && (revision >= 7 || id !== 'app-tools-direct-node'));
+      const old = buildOptimizedInstallation(original, originalExe, oldOptions, revision);
+      fs.writeFileSync(target, old.asar); fs.writeFileSync(exe, old.exe);
+      fs.writeFileSync(path.join(directory, SELECTION_FILE), JSON.stringify({format:1,options:oldOptions,...(revision>=6?{revision}:{}),beforeHashes:baseline}));
+      assert.equal(inspectUpgrade(target).state, 'upgraded');
+      assert.equal(inspectUpgrade(target).matchesSelection, false);
+      if (failingTarget) {
+        fs.renameSync = (from,to) => {if(to===failingTarget)throw Error('revision interrupted');return rename(from,to)};
+        assert.throws(() => applyUpgrade(target, () => {}), /revision interrupted/);
+        fs.renameSync = rename;
+        assert.equal(inspectUpgrade(target).state, failingTarget === target ? 'upgraded' : 'partial');
+        if (failingTarget === target) {
+          applyUpgrade(target, () => {});
+          assert.equal(inspectUpgrade(target).matchesSelection, true);
+        }
+      } else {
+        applyUpgrade(target, () => {});
+        assert.equal(inspectUpgrade(target).matchesSelection, true);
+      }
+      restoreUpgrade(target, () => {});
+      assert.deepEqual([target,exe].map(hashFile), baseline);
+      assert.deepEqual([target,exe].map(p=>fs.statSync(p+UPGRADE_BACKUP_SUFFIX).mtimeMs), backupTimes);
+    }
+  } finally {
+    fs.renameSync = rename;
+    const relative = path.relative(fs.realpathSync(os.tmpdir()), fs.realpathSync(directory));
+    assert.ok(!relative.startsWith('..') && !path.isAbsolute(relative) && relative.startsWith('codex-perf-test-'));
+    fs.rmSync(directory, {recursive:true,force:true});
+  }
+});
+
+
+test('direct app tools startup preserves arguments, policy, environment and alternate launch paths', async () => {
+  const result = transformAppToolsLaunch(appToolsFactory).bytes.toString();
+  const base = {command:'cmd.exe',args:['/d','/s','/c','call','./scripts/launch_codex_app_tools_mcp.cmd','./server.mjs'],
+    env:{PIPE:'value'},env_vars:['PATH'],default_tools_approval_mode:'approve',tools:{write:{approval_mode:'prompt'}},tool_timeout_sec:3600};
+  for(const [platform,useWsl,node,custom] of [['win32',false,'C:/Node With Spaces/node.exe',false],['win32',true,'node',false],['linux',false,'node',false],['win32',false,null,false],['win32',false,'node',true]]) {
+    const config=structuredClone(base);if(custom)config.args.push('--custom');
+    const context={pipe:true,runtime:node,definition:{mcpServers:{codex_app:config}},process:{platform},fail:reason=>({error:reason})};
+    const factory=vm.runInNewContext(result+';appTools',context);
+    const actual=await factory({useWsl,resourcesPath:'C:/Plugin With Spaces'});
+    const original=await vm.runInNewContext(appToolsFactory+';appTools',{...context,definition:{mcpServers:{codex_app:structuredClone(custom?{...base,args:[...base.args,'--custom']}:base)}}})({useWsl,resourcesPath:'C:/Plugin With Spaces'});
+    if(platform==='win32'&&!useWsl&&node&&!custom){original.command=node;original.args=['./server.mjs']}
+    assert.deepEqual(JSON.parse(JSON.stringify(actual)),JSON.parse(JSON.stringify(original)));
+  }
+  assert.throws(()=>transformAppToolsLaunch(result),/已包含/);
+  assert.throws(()=>transformAppToolsLaunch(''),/唯一匹配/);
+  assert.throws(()=>transformAppToolsLaunch(appToolsFactory+appToolsFactory.replace('function appTools','function other')),/唯一匹配/);
+  assert.throws(()=>transformAppToolsLaunch(appToolsFactory.replace('CODEX_MCP_NODE_PATH','changed')),/唯一匹配/);
+});
+
+test('custom retention survives repeated upgrades, interrupted replacement, rollback and copy delivery', () => {
+  assert.deepEqual(parsePatchArguments([]), { selected: undefined, inactiveMinutes: 5 });
+  assert.deepEqual(parsePatchArguments(['--inactive-minutes=15','--options=menu']), { selected: ['menu'], inactiveMinutes: 15 });
+  for (const args of [['--inactive-minutes=0'], ['--inactive-minutes=181'], ['--inactive-minutes=1.5'], ['--inactive-minutes=abc'], ['--inactive-minutes=5','--inactive-minutes=15']]) assert.throws(() => parsePatchArguments(args));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-perf-test-'));
+  const target = path.join(directory, 'source', 'resources', 'app.asar'), exe = path.join(directory, 'source', 'ChatGPT.exe');
+  const recordFile = path.join(directory, 'source', SELECTION_FILE), selected = ['inactive-thread-unsubscribe'];
+  const rename = fs.renameSync;
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    const original = fixture(); fs.writeFileSync(target, original); fs.writeFileSync(exe, exeFixture(original));
+    fs.writeFileSync(path.join(path.dirname(exe), 'chrome.dll'), 'runtime fixture');
+    fs.mkdirSync(path.join(path.dirname(exe), 'locales'));
+    fs.mkdirSync(path.join(path.dirname(target), 'app.asar.unpacked'));
+    const baseline = [target, exe].map(hashFile);
+    applyUpgrade(target, () => {}, selected, 5);
+    const backupTimes = [target, exe].map(file => fs.statSync(file + UPGRADE_BACKUP_SUFFIX).mtimeMs);
+    applyUpgrade(target, () => {}, selected, 15);
+    assert.equal(inspectUpgrade(target, selected, 15).matchesSelection, true);
+    assert.equal(inspectUpgrade(target, selected, 5).matchesSelection, false);
+    assert.equal(inspectUpgrade(target, selected).installedInactiveMinutes, 15);
+    const saved = JSON.parse(fs.readFileSync(recordFile));
+    assert.equal(saved.inactiveMinutes, 15); assert.equal(saved.previousInactiveMinutes, 5);
+    const output = path.join(directory, 'copy');
+    createCopy(target, output, selected, 30);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(output, MANIFEST))).inactiveMinutes, 30);
+    assert.equal(verifyCopy(output).status, 'copy-verified');
+    assert.equal(hashFile(path.join(output, 'resources', 'app.asar')), buildOptimizedPatch(original, selected, 8, 30).report.candidateSha256);
+    // 记录先落盘、配套文件替换中断时，必须用各自的时限重建哈希。
+    for (const failAt of [target, exe]) {
+      fs.renameSync = (from, to) => { if (to === failAt) throw Error('retention interrupted'); return rename(from, to); };
+      assert.throws(() => applyUpgrade(target, () => {}, selected, 30), /retention interrupted/);
+      fs.renameSync = rename;
+      assert.equal(inspectUpgrade(target, selected, 30).state, failAt === target ? 'upgraded' : 'partial');
+      if (failAt === target) {
+        assert.equal(inspectUpgrade(target, selected, 15).installedInactiveMinutes, 15);
+        applyUpgrade(target, () => {}, selected, 30);
+        applyUpgrade(target, () => {}, selected, 15);
+      }
+    }
+    restoreUpgrade(target, () => {});
+    assert.deepEqual([target, exe].map(hashFile), baseline);
+    assert.deepEqual([target, exe].map(file => hashFile(file + UPGRADE_BACKUP_SUFFIX)), baseline);
+    assert.deepEqual([target, exe].map(file => fs.statSync(file + UPGRADE_BACKUP_SUFFIX).mtimeMs), backupTimes);
+  } finally {
+    fs.renameSync = rename;
+    const relative = path.relative(fs.realpathSync(os.tmpdir()), fs.realpathSync(directory));
+    assert.ok(!relative.startsWith('..') && !path.isAbsolute(relative) && relative.startsWith('codex-perf-test-'));
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('shared app-tools transform preserves original dispatch and only rewrites local plugin transport', async () => {
+  const result = transformSharedAppTools(sharedAppTools).bytes.toString();
+  const base = {command:'cmd.exe',args:['/d','/s','/c','call','./scripts/launch_codex_app_tools_mcp.cmd','./server.mjs'],env:{PIPE:'pipe'},cwd:'cwd',env_vars:['PATH'],
+    enabled:true,default_tools_approval_mode:'approve',tools:{write:{approval_mode:'prompt'}},enabled_tools:['list_projects'],tool_timeout_sec:3600};
+  const host = {url:'http://127.0.0.1:1234/mcp',httpHeaders:{Authorization:'Bearer test'}};
+  const expected = {enabled:true,default_tools_approval_mode:'approve',tools:{write:{approval_mode:'prompt'}},enabled_tools:['list_projects'],tool_timeout_sec:3600,url:host.url,http_headers:host.httpHeaders};
+  assert.deepEqual(sharedAppToolsConfig(base,host,false,'win32'),expected);
+  assert.deepEqual(sharedAppToolsConfig({...base,command:'C:/Node With Spaces/node.exe',args:['./server.mjs']},host,false,'win32'),expected);
+  assert.equal(sharedAppToolsConfig(base,host,true,'win32'),base);
+  assert.equal(sharedAppToolsConfig(base,host,false,'linux'),base);
+  const custom = {...base,args:['custom.mjs']}; assert.equal(sharedAppToolsConfig(custom,host,false,'win32'),custom);
+  assert.throws(()=>sharedAppToolsConfig(base,null,false,'win32'),/尚未就绪/);
+  // 同一转换入口启动真实 HTTP 服务，验证内联函数没有丢失依赖与闭包。
+  let closed = false;
+  const context = vm.createContext({process:{platform:'win32',env:{}},require:name=>name==='node:http'?http:crypto,
+    Buffer,AbortController,server:{setMessageCallback(){},close(){closed=true}}});
+  vm.runInContext(result,context);
+  const native = await context.startPipe({listTools:async()=>[{type:'namespace',name:'codex_app',tools:[{name:'list_projects',inputSchema:{type:'object'}}]}],callTool:async()=>({success:true,contentItems:[]})});
+  try {
+    let config;
+    await context.writePlugin({sendAppServerRequest:async(_method,params)=>{config=JSON.parse(params.value).mcpServers.codex_app}},structuredClone(base),false);
+    assert.match(config.url,/^http:\/\/127\.0\.0\.1:\d+\/mcp$/);
+    assert.equal(config.command,undefined); assert.deepEqual(config.tools,base.tools);
+  } finally {await native.dispose()}
+  assert.equal(closed,true);
+  assert.throws(()=>transformSharedAppTools(result),/已包含/);
+  assert.throws(()=>transformSharedAppTools(sharedAppTools.replace('setMessageCallback','changed')),/唯一匹配/);
+  assert.throws(()=>transformSharedAppTools(sharedAppTools+sharedAppTools.replaceAll('nativePipe','otherPipe').replaceAll('catalog','otherCatalog').replaceAll('startPipe','otherStart').replaceAll('writePlugin','otherWrite')),/唯一匹配/);
+});
+
+test('shared app-tools HTTP keeps fresh schemas, caller metadata, approvals, cancellation and session isolation', {timeout:10000}, async () => {
+  const calls = [], pending = new Map(); let toolName = 'inspect', reads = 0;
+  const host = await createSharedAppToolsHost({callerHostId:'local',listTools:async()=>{reads++;return [{name:toolName,namespace:'codex_app',inputSchema:{properties:{}},annotations:{destructiveHint:true}}]},
+    callTool:async (request,signal)=>{
+      calls.push(request);
+      if(request.params.arguments.wait) await new Promise((resolve,reject)=>{pending.set(request.params.callId,resolve);signal.addEventListener('abort',()=>reject(signal.reason),{once:true})});
+      return {success:true,contentItems:[{type:'inputText',text:request.params.threadId},{type:'inputImage',imageUrl:'data:image/png;base64,YQ=='},{type:'inputAudio',audioUrl:'data:audio/wav;base64,Yg=='}]};
+    }},{http,crypto});
+  const post = async(session,message,headers={})=>fetch(host.url,{method:'POST',headers:{...host.httpHeaders,'content-type':'application/json',...(session?{'mcp-session-id':session}:{}),...headers},body:JSON.stringify(message)});
+  const message = (id,method,params)=>({jsonrpc:'2.0',id,method,params});
+  async function initialize(){const response=await post(null,message(1,'initialize',{protocolVersion:'2025-06-18'}));assert.equal(response.status,200);assert.equal((await response.json()).result.serverInfo.name,'codex-app-tools');return response.headers.get('mcp-session-id')}
+  const rpc = async(session,id,method,params)=>(await post(session,message(id,method,params))).json();
+  async function untilCall(id){for(let i=0;i<100&&!pending.has(id);i++)await new Promise(resolve=>setTimeout(resolve,10));assert(pending.has(id),'Tool did not start')}
+  try {
+    assert.equal((await post(null,message(1,'initialize',{}),{Authorization:'invalid'})).status,403);
+    assert.equal((await post(null,message(1,'initialize',{}),{Origin:'http://example.invalid'})).status,403);
+    assert.equal(await new Promise((resolve,reject)=>{
+      const req=http.request(host.url,{method:'POST',headers:{...host.httpHeaders,Host:'example.invalid','content-type':'application/json'}},res=>{res.resume();res.on('end',()=>resolve(res.statusCode))});
+      req.on('error',reject);req.end(JSON.stringify(message(1,'initialize',{})));
+    }),403);
+    const a=await initialize(),b=await initialize(); assert.notEqual(a,b);
+    assert.equal(reads,0);
+    const listing=await rpc(a,2,'tools/list');
+    assert.equal(listing.result.tools[0].inputSchema.type,'object'); assert.equal(listing.result.tools[0].namespace,undefined);
+    assert.equal(listing.result.tools[0].annotations.destructiveHint,true);
+    toolName='updated'; assert.equal((await rpc(a,3,'tools/list')).result.tools[0].name,'updated');
+    assert.equal((await rpc(a,4,'tools/call',{name:'inspect'})).error.code,-32602);
+    assert.equal((await rpc(a,5,'tools/call',{name:'updated'})).error.code,-32602);
+    const result=await rpc(a,6,'tools/call',{name:'updated',arguments:{},_meta:{'x-codex-turn-metadata':JSON.stringify({thread_id:'thread-a',turn_id:'turn-a'}),'openai/toolCallId':'call-a'}});
+    assert.deepEqual(result.result,{isError:false,content:[{type:'text',text:'thread-a'},{type:'image',mimeType:'image/png',data:'YQ=='},{type:'audio',mimeType:'audio/wav',data:'Yg=='}]});
+    assert.deepEqual(calls[0],{callerSource:'codex',hostId:'local',params:{arguments:{},namespace:'codex_app',tool:'updated',threadId:'thread-a',callId:'call-a',turnId:'turn-a'}});
+    const params=id=>({name:'updated',arguments:{wait:true},_meta:{thread:{id},call:{id},turn:{id:'turn'}}});
+    const one=rpc(a,10,'tools/call',params('a')),two=rpc(b,10,'tools/call',params('b'));
+    await untilCall('a');await untilCall('b');
+    assert.equal((await rpc(a,10,'ping')).error.code,-32600);
+    await post(a,{jsonrpc:'2.0',method:'notifications/cancelled',params:{requestId:10}});
+    assert.equal((await one).error.code,-32800);
+    pending.get('b')();assert.equal((await two).result.content[0].text,'b');
+    const three=rpc(a,11,'tools/call',params('delete'));await untilCall('delete');
+    assert.equal((await fetch(host.url,{method:'DELETE',headers:{...host.httpHeaders,'mcp-session-id':a}})).status,200);
+    assert.equal((await three).error.code,-32800);
+    assert.equal((await post(a,message(12,'ping'))).status,404);
+    assert.deepEqual((await rpc(b,12,'ping')).result,{});
+  } finally {await host.close()}
 });

@@ -1,4 +1,6 @@
 import { createRequire } from 'node:module';
+import { createSharedAppToolsHost, sharedAppToolsConfig } from './app-tools-host.mjs';
+import { normalizeInactiveMinutes } from './options.mjs';
 // 参考 Codex++ 13d0c242 的对应变换；MCP 仅合并短时事件，不采用缓存年龄门控。
 const acorn = createRequire(import.meta.url)('./vendor/acorn.cjs');
 export const RUNTIME_MARKER = '/*codex-lite-runtime:v1*/';
@@ -100,7 +102,8 @@ const member = (node, name) => node?.type === 'CallExpression' && node.callee.ty
 const label = node => node?.type === 'Literal' ? node.value : node?.type === 'TemplateLiteral' && node.expressions.length === 0 ? node.quasis[0].value.cooked : null;
 
 // 复用原会话退订流程，只缩短保留期；不改执行中、活跃视图及其他订阅者的保护条件。
-export function transformInactiveThreads(source, kind) {
+export function transformInactiveThreads(source, kind, inactiveMinutes = 5) {
+  const ttlMs = normalizeInactiveMinutes(inactiveMinutes) * 60000;
   const marker = '/*codex-lite-inactive:v1*/';
   if (source.includes(marker)) throw new Error('已包含非活跃会话补丁。');
   const tree = acorn.parse(source, { ecmaVersion: 'latest', sourceType: 'module' });
@@ -129,9 +132,117 @@ export function transformInactiveThreads(source, kind) {
     if (value?.type === 'Literal' && value.value === 10800000) bindings.push(value);
   });
   if (bindings.length !== 1) throw new Error('非活跃会话 3 小时时限：应唯一匹配，当前版本暂不支持。');
-  const value = bindings[0], result = source.slice(0, value.start) + marker + '300000' + source.slice(value.end);
+  const value = bindings[0], result = source.slice(0, value.start) + marker + ttlMs + source.slice(value.end);
   acorn.parse(result, { ecmaVersion: 'latest', sourceType: 'module' });
   return { bytes: Buffer.from(result), edits: [{ name: `inactive-thread-unsubscribe-${kind}`, start: value.start, end: value.end }] };
+}
+
+// 页面仍留在缓存中，但隐藏页不再持有活跃租约；同步改写编译器缓存的比较与赋值。
+export function transformInactiveViewLease(source) {
+  const marker = '/*codex-lite-view-lease:v1*/';
+  if (source.includes(marker)) throw new Error('已包含隐藏会话租约补丁。');
+  const tree = acorn.parse(source, { ecmaVersion: 'latest', sourceType: 'module' }), matches = [];
+  walk(tree, node => {
+    if (node.type !== 'FunctionDeclaration') return;
+    const active = [], leases = [], roles = new Set();
+    walk(node.body, (n, ancestors) => {
+      if (n.type === 'Property' && label(n.key) === 'data-app-shell-active-page' && n.value.type === 'Identifier') active.push(n.value.name);
+      if (n.type === 'MemberExpression' && !n.computed && n.property.name === 'lease' && n.object.type === 'Identifier') {
+        leases.push(n);
+        const parent = ancestors.at(-1);
+        if (parent.type === 'BinaryExpression' && parent.operator === '!==' && parent.right === n) roles.add('compare');
+        if (parent.type === 'AssignmentExpression' && parent.operator === '=' && parent.right === n) roles.add('cache');
+        if (parent.type === 'ArrayExpression' && ancestors.at(-2)?.key?.name === 'children') roles.add('render');
+      }
+    });
+    if (active.length === 1 && leases.length === 3 && roles.size === 3 && leases.every(n => n.object.name === leases[0].object.name)) matches.push({ active: active[0], leases });
+  });
+  if (matches.length !== 1) throw new Error(`隐藏会话租约：应唯一匹配，实际匹配 ${matches.length} 处。`);
+  const { active, leases } = matches[0];
+  let result = source;
+  for (const n of [...leases].sort((a, b) => b.start - a.start))
+    result = result.slice(0, n.start) + `${marker}(${active}?${source.slice(n.start, n.end)}:null)` + result.slice(n.end);
+  acorn.parse(result, { ecmaVersion: 'latest', sourceType: 'module' });
+  return { bytes: Buffer.from(result), edits: [{ name: 'inactive-thread-view-lease' }] };
+}
+
+// 只替换已审计的 Windows 启动包装；保留 cwd、环境、工具审批和非 Windows 路径。
+function directAppTools(config, node, useWsl, platform) {
+  const args = ['/d', '/s', '/c', 'call', './scripts/launch_codex_app_tools_mcp.cmd', './server.mjs'];
+  if (platform !== 'win32' || useWsl || !node || config.command !== 'cmd.exe' ||
+      !Array.isArray(config.args) || config.args.length !== args.length || !args.every((arg, i) => config.args[i] === arg)) return config;
+  return { ...config, command: node, args: ['./server.mjs'] };
+}
+
+export function transformAppToolsLaunch(source) {
+  const marker = '/*codex-lite-app-tools-node:v1*/';
+  if (source.includes(marker)) throw new Error('已包含应用工具直接启动补丁。');
+  const tree = acorn.parse(source, { ecmaVersion: 'latest', sourceType: 'module' }), matches = [];
+  walk(tree, fn => {
+    if (fn.type !== 'FunctionDeclaration' || !fn.async || fn.params[0]?.type !== 'ObjectPattern') return;
+    const wsl = fn.params[0].properties.find(p => p.key?.name === 'useWsl')?.value;
+    if (wsl?.type !== 'Identifier' || !fn.params[0].properties.some(p => p.key?.name === 'resourcesPath')) return;
+    const code = source.slice(fn.start, fn.end);
+    if (!code.includes('missing-pipe') || !code.includes('missing-windows-runtime') || !code.includes('codex_app')) return;
+    const runtime = [], returns = [];
+    walk(fn.body, node => {
+      if (node.type === 'AssignmentExpression' && node.operator === '=' && node.left.type === 'MemberExpression' &&
+          node.left.property.name === 'CODEX_MCP_NODE_PATH' && node.right.type === 'Identifier') runtime.push(node.right.name);
+      if (node.type === 'ReturnStatement' && node.argument?.type === 'ObjectExpression' &&
+          ['command', 'cwd', 'enabled', 'env'].every(key => node.argument.properties.some(p => p.key?.name === key))) returns.push(node.argument);
+    });
+    if (runtime.length === 1 && returns.length === 1) matches.push({ node: returns[0], runtime: runtime[0], wsl: wsl.name });
+  });
+  if (matches.length !== 1) throw new Error(`应用工具启动配置：应唯一匹配，实际匹配 ${matches.length} 处。`);
+  const { node, runtime, wsl } = matches[0];
+  const result = source.slice(0, node.start) + `${marker}(${directAppTools.toString().replace(/\r\n?/g, '\n')})(${source.slice(node.start, node.end)},${runtime},${wsl},process.platform)` + source.slice(node.end);
+  acorn.parse(result, { ecmaVersion: 'latest', sourceType: 'module' });
+  return { bytes: Buffer.from(result), edits: [{ name: 'app-tools-direct-node' }] };
+}
+
+export function transformSharedAppTools(source) {
+  const marker = '/*codex-lite-shared-app-tools:v1*/';
+  if (source.includes(marker)) throw new Error('已包含应用工具共享通道补丁。');
+  const tree = acorn.parse(source, { ecmaVersion: 'latest', sourceType: 'script' });
+  const servers = [], catalogs = [], writers = [];
+  walk(tree, fn => {
+    if (fn.type !== 'FunctionDeclaration') return;
+    const text = source.slice(fn.start, fn.end);
+    if (fn.async && fn.params[0]?.type === 'ObjectPattern' &&
+        ['callTool', 'listTools', 'readBrowserAccess', 'prepareTaskWorkspace'].every(key => fn.params[0].properties.some(p => p.key?.name === key)) &&
+        text.includes('verifyingIdentity') && text.includes('setMessageCallback')) servers.push(fn.id.name);
+    if (text.includes('.flatMap(') && text.includes('send_message_to_thread') && text.includes('destructiveHint') && text.includes('inputSchema') && text.includes('namespace:')) catalogs.push(fn.id.name);
+    if (!fn.async || !text.includes('config/batchWrite') || !text.includes('delete ') || !text.includes('CODEX_MCP_NODE_PATH')) return;
+    const wsl = [], configs = [];
+    walk(fn.body, node => {
+      if (node.type === 'Property' && node.key?.name === 'useWsl' && node.value.type === 'Identifier') wsl.push(node.value.name);
+      if (node.type === 'Property' && node.key?.name === 'codex_app' && node.value.type === 'Identifier') configs.push(node.value);
+    });
+    if (wsl.length === 1 && configs.length === 1) writers.push({ node: configs[0], wsl: wsl[0] });
+  });
+  if (servers.length !== 1 || catalogs.length !== 1 || writers.length !== 1) throw new Error('共享应用工具入口、目录及配置写入点必须唯一匹配。');
+  const calls = [];
+  walk(tree, node => {
+    if (node.type === 'CallExpression' && node.callee.name === servers[0] && node.arguments[0]?.type === 'ObjectExpression' &&
+        ['callTool', 'listTools', 'readBrowserAccess', 'prepareTaskWorkspace'].every(key => node.arguments[0].properties.some(p => p.key?.name === key))) calls.push(node.callee);
+  });
+  if (calls.length !== 1) throw new Error('共享应用工具启动调用必须唯一匹配。');
+  const { node, wsl } = writers[0];
+  // 安装记录按字节重建，避免 Git 换行转换改变同一算法版本的产物。
+  const configCode = sharedAppToolsConfig.toString().replace(/\r\n?/g, '\n');
+  const hostCode = createSharedAppToolsHost.toString().replace(/\r\n?/g, '\n');
+  const edits = [{ start: calls[0].start, end: calls[0].end, text: '__clStartAppTools' },
+    { start: node.start, end: node.end, text: `(${configCode})(${node.name},__clSharedAppTools,${wsl},process.platform)` }];
+  let result = source;
+  for (const edit of edits.sort((a, b) => b.start - a.start)) result = result.slice(0, edit.start) + edit.text + result.slice(edit.end);
+  result += `\n${marker}\nvar __clSharedAppTools;\nasync function __clStartAppTools(options){
+    const native=await ${servers[0]}(options);if(process.platform!=='win32')return native;
+    let host;try{host=await (${hostCode})({listTools:async()=>${catalogs[0]}(await options.listTools('all')),callTool:options.callTool,callerHostId:process.env.CODEX_APP_TOOLS_CALLER_HOST_ID},{http:require('node:http'),crypto:require('node:crypto')});}
+    catch(error){await native.dispose();throw error;}
+    __clSharedAppTools=host;return {...native,dispose:async()=>{__clSharedAppTools=null;await Promise.all([host.close(),native.dispose()]);}};
+  }\n`;
+  acorn.parse(result, { ecmaVersion: 'latest', sourceType: 'script' });
+  return { bytes: Buffer.from(result), edits: [{ name: 'app-tools-shared-host' }] };
 }
 
 export function transformRuntime(source, kind, selected) {

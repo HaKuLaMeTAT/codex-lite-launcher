@@ -4,7 +4,7 @@
 
 Optional performance patches for the Windows Codex desktop app. Reduce hidden-window preloading, batch frequent output and refresh events, and avoid unnecessary background work.
 
-- **Choose your optimizations**: 12 options, all enabled by default and individually selectable.
+- **Choose your optimizations**: 14 options, all enabled by default, with a configurable inactive-session timeout.
 - **Two deployment modes**: patch an existing installation in place or create a separate optimized copy.
 - **Rollback support**: in-place upgrades retain paired backups and a record of selected options.
 - **Source only**: run locally with Node.js and PowerShell; no npm dependency installation required.
@@ -39,7 +39,7 @@ You can also double-click `启动补丁.cmd` in File Explorer. You do not need t
 The launcher currently uses Chinese labels. Their English meanings are included below:
 
 1. Confirm the detected Codex installation, or click **选择来源** (Select source).
-2. Choose **原位升级** (In-place upgrade) or **独立副本** (Separate copy), then select the optimizations you want.
+2. Choose **原位升级** (In-place upgrade) or **独立副本** (Separate copy), select your optimizations, and adjust **会话保留** (Session retention) if needed.
 3. Click **原位升级** (In-place upgrade) or **生成副本** (Generate copy) directly. The operation validates the source and current options before making changes.
 4. **检查来源** (Check source) is optional for previewing compatibility and disk requirements. Changing parameters does not require another manual check.
 
@@ -87,9 +87,19 @@ All options are enabled by default. Both modes use the same patch logic. Deselec
 | Merge text nodes after animation | Merges consecutive plain-text fragments after fade-in completes; preserves links, decorations, and fragments still animating |
 | Reuse code-language detection | Reduces repeated automatic detection, with corrections as content changes and after streaming stops; explicit languages remain unchanged, and timer cleanup is enabled with this option |
 | Batch MCP tool-list refreshes | Handles the first ready event immediately and adds one trailing refresh for repeats within 200 ms; failure, authorization, and other handling remain unchanged |
-| Unsubscribe inactive sessions after 5 minutes | Reuses the original release checks and shortens background retention; reopening may require tool recreation |
+| Launch app tools directly with Node | Bypasses the CMD wrapper for local Windows app tools while preserving permissions, environment, and tools; leaves WSL unchanged |
+| Unsubscribe inactive sessions after a timeout | Defaults to 5 minutes; accepts 1–180 minutes and retains the original release checks; reopening may recreate tools |
+| Share the app-tools channel | Local Windows `codex_app` connections use the existing desktop main process, removing per-session Node/CMD adapters while retaining the original handlers and approval configuration |
 
-The new session option reduces the original unsubscribe timeout from 3 hours to 5 minutes, retaining the existing capacity rule of up to 10 inactive sessions. It only affects sessions that pass the original release checks. Running sessions, sessions with active views, and sessions with other subscribers are protected. Deselect it to retain the original policy.
+When you switch away, the hidden page releases its active-session lease while its content can remain cached. Returning reacquires the lease. The inactivity timer no longer waits for the roughly 10-minute page cache to expire first.
+
+With the session option enabled, **会话保留** (Session retention) accepts **integer minutes from 1 to 180, defaulting to 5**. Deselect the option to keep the original 3-hour policy. On startup, the GUI reads the timeout from the selected installation record; an explicit `-InactiveMinutes` argument takes precedence. Change the value and apply directly without manually checking again. Exit Codex, apply the patch, and restart for it to take effect.
+
+The timeout is saved alongside the selected options in the installation record or copy manifest. Repeated upgrades reuse the same baseline backups; rollback validates the recorded settings independently of the current UI value. The original capacity rule of up to 10 inactive sessions remains, so this timeout is not a minimum retention guarantee. Running sessions, active views, and other subscribers retain their original protection.
+
+The shared channel applies only to standard local Windows app-tools configurations. Each list or call reads the current desktop catalog and dispatches through the original handlers. The existing backend connects to a loopback-only HTTP endpoint with a random credential; the app's existing synchronization flow updates the local plugin configuration. WSL, remote-executor exports, and custom launch arguments retain their original paths. When both app-tools options are selected, the shared channel takes precedence for standard local configurations.
+
+CUA, REPL, and code-review services do not use the shared channel. This does not make every MCP server start on first use. The default timeout remains 5 minutes; increasing it can reduce session recreation while retaining other tools for longer.
 
 **Unsubscribing does not guarantee immediate tool-process exit.** The backend still controls actual cleanup. The [official SessionEnd documentation](https://learn.chatgpt.com/docs/hooks#sessionend) describes an idle cleanup period of about 30 minutes without connected clients; this is not a measured exit deadline for the installed binary. After cleanup, reopening a session may need to recreate tools, and in-memory state such as REPL variables is not guaranteed to survive. The tool does not forcibly kill processes or delete conversation history. This option does not defer tool startup until its first invocation.
 
@@ -112,6 +122,8 @@ The following sample was taken during early on-demand loading optimization work 
 **These are historical observations, not a controlled benchmark or a performance guarantee.** The before sample lasted about 61 seconds after 11–12 minutes of app uptime; the after sample lasted about 30 seconds after 4–5 minutes of uptime. Sessions, activity, and window states were not controlled, so the full difference cannot be attributed to the patches. CPU is normalized to total machine capacity at 100%; memory figures use private memory.
 
 These figures do not represent every option combination or independently measure the later output, highlighting, refresh, and session-unsubscribe optimizations. The project does not claim to fix long-term memory leaks. Only an anonymized summary is published, not raw personal sampling logs.
+
+In isolated tests on 2026-10-17, the original app-tools chain used `cmd.exe + node.exe + conhost.exe`; direct Node launch used `node.exe + conhost.exe`, saving one process. The shared channel then passed caller-metadata checks across two sessions using the real `codex-cli 0.159.0` backend. It discovered 55 tools from the running desktop and completed two read-only project-list calls without starting stdio adapter workers. These results are not desktop-wide process measurements. Full desktop behavior, approval interactions, memory, and CPU benefits after installation still need measurement.
 
 ## Compatibility and updates
 
@@ -141,10 +153,15 @@ node .\copy.mjs verify 'C:\Apps\Codex-optimized'
 
 Omitting `--options` selects all optimizations. Inspection, application, and generation commands accept comma-separated option IDs; `--options=none` selects none. Rollback and copy verification do not accept option arguments.
 
+Inspection, application, and generation also accept `--inactive-minutes=15`, defaulting to 5 when omitted. It changes the session policy only when `inactive-thread-unsubscribe` is selected. To set the GUI's initial value, run `powershell -File .\launcher.ps1 -InactiveMinutes 15`.
+
 ```powershell
 # Select only menu refresh batching and terminal output batching
 node .\inplace.mjs inspect 'C:\Apps\Codex\app\resources\app.asar' --options=menu,batched-pty-output
 node .\inplace.mjs apply 'C:\Apps\Codex\app\resources\app.asar' --options=menu,batched-pty-output
+
+# Select all optimizations and retain inactive sessions for 15 minutes
+node .\inplace.mjs apply 'C:\Apps\Codex\app\resources\app.asar' --inactive-minutes=15
 
 # Run automated tests
 npm test

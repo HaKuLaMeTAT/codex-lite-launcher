@@ -17,3 +17,22 @@ export function parseOptionsArgument(value) {
   const text = value.slice('--options='.length);
   return normalizeOptions(text === 'none' ? [] : text.split(','));
 }
+
+export function normalizeInactiveMinutes(value = 5) {
+  if (!Number.isInteger(value) || value < 1 || value > 180) throw new Error('非活跃会话保留时间须为 1–180 的整数分钟。');
+  return value;
+}
+
+export function parsePatchArguments(args) {
+  let selected, inactiveMinutes = 5;
+  const seen = new Set();
+  for (const arg of args) {
+    const name = arg.split('=')[0];
+    if (seen.has(name)) throw new Error('补丁参数重复：' + name);
+    seen.add(name);
+    if (name === '--options') selected = parseOptionsArgument(arg);
+    else if (/^--inactive-minutes=\d+$/.test(arg)) inactiveMinutes = normalizeInactiveMinutes(Number(arg.slice('--inactive-minutes='.length)));
+    else throw new Error('未知或无效的补丁参数：' + arg);
+  }
+  return { selected, inactiveMinutes };
+}

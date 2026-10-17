@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveUpgrade, requireStopped, sha256 } from './patch.mjs';
-import { parseOptionsArgument } from './options.mjs';
+import { parsePatchArguments } from './options.mjs';
 
 const TEMP_SUFFIX = '.lite-v5.tmp';
 function check(ok, message) { if (!ok) throw new Error(message); }
@@ -19,11 +19,11 @@ function report(plan, status = 'upgrade-ready') {
   const disk = fs.statfsSync(path.dirname(plan.target));
   return { ...plan.candidate.report, status, state: plan.state, beforeState: plan.beforeState,
     backup: plan.backup, exeBackup: plan.exeBackup, canRestore: plan.backupsComplete,
-    installedOptions: plan.installedOptions, matchesSelection: plan.matchesSelection,
+    installedOptions: plan.installedOptions, installedInactiveMinutes: plan.installedInactiveMinutes, matchesSelection: plan.matchesSelection,
     requiredFreeBytes: backupBytes + stageBytes, backupBytes: items.reduce((sum, item) => sum + item.before.length, 0),
     freeBytes: disk.bavail * disk.bsize };
 }
-export function inspectUpgrade(target, selected) { return report(resolveUpgrade(target, selected)); }
+export function inspectUpgrade(target, selected, inactiveMinutes) { return report(resolveUpgrade(target, selected, false, inactiveMinutes)); }
 function currentUnchanged(plan) {
   check([plan.target, plan.exe].every((file, i) => sha256(fs.readFileSync(file)) === plan.currentHashes[i]), '准备期间安装文件发生变化，已停止。');
   check((fs.existsSync(plan.selectionFile) ? fs.readFileSync(plan.selectionFile, 'utf8') : null) === plan.selectionText, '准备期间优化选项记录发生变化，已停止。');
@@ -53,9 +53,9 @@ function replace(items, direction) {
     throw new Error(`替换未完成：${error.message}。请保持 Codex 关闭，重新检查后执行原位回滚。`);
   }
 }
-export function applyUpgrade(target, requireIdle = requireStopped, selected) {
+export function applyUpgrade(target, requireIdle = requireStopped, selected, inactiveMinutes) {
   requireIdle();
-  const plan = resolveUpgrade(target, selected), info = report(plan), items = files(plan);
+  const plan = resolveUpgrade(target, selected, false, inactiveMinutes), info = report(plan), items = files(plan);
   if (plan.state !== 'partial' && plan.matchesSelection) return report(plan, 'upgrade-applied');
   check(plan.state !== 'partial', '安装处于半完成状态，请先执行原位回滚。');
   check(info.freeBytes >= info.requiredFreeBytes, `磁盘空间不足，至少需要 ${(info.requiredFreeBytes / 1024 ** 3).toFixed(2)} GiB 可用空间。`);
@@ -65,18 +65,19 @@ export function applyUpgrade(target, requireIdle = requireStopped, selected) {
     if (!fs.existsSync(item.backup)) fs.copyFileSync(item.target, item.backup, fs.constants.COPYFILE_EXCL);
     check(sha256(fs.readFileSync(item.backup)) === sha256(item.before), `回滚备份校验失败：${item.backup}`);
   }
+  // 文件准备和二次退出检查通过后才登记新版本，避免准备失败提前改变安装记录。
+  stage(items, 'after');
+  requireIdle(); currentUnchanged(plan);
   // 始终复用最初配套备份；升级期间记录上一组选项，不额外复制一份旧补丁安装。
-  const record = { format: 1, options: plan.candidate.report.selectedOptions, beforeHashes: plan.beforeHashes,
-    ...(plan.state === 'upgraded' ? { previousOptions: plan.installedOptions } : {}) };
+  const record = { format: 1, revision: plan.candidate.report.patchVersion, options: plan.candidate.report.selectedOptions, inactiveMinutes: plan.candidate.report.inactiveMinutes, beforeHashes: plan.beforeHashes,
+    ...(plan.state === 'upgraded' ? { previousOptions: plan.installedOptions, previousRevision: plan.installedRevision, previousInactiveMinutes: plan.installedInactiveMinutes } : {}) };
   const selectionText = JSON.stringify(record, null, 2) + '\n';
   fs.writeFileSync(plan.selectionFile + '.tmp', selectionText, { flag: 'wx' });
   fs.renameSync(plan.selectionFile + '.tmp', plan.selectionFile);
   plan.selectionText = selectionText;
-  stage(items, 'after');
-  requireIdle(); currentUnchanged(plan);
   replace(items, 'after');
   // 上一组选项只是少量恢复元数据，下次升级直接覆盖，不累积文件或历史记录。
-  return report({ ...plan, state: 'upgraded', backupsComplete: true, matchesSelection: true, installedOptions: plan.candidate.report.selectedOptions }, 'upgrade-applied');
+  return report({ ...plan, state: 'upgraded', backupsComplete: true, matchesSelection: true, installedOptions: plan.candidate.report.selectedOptions, installedInactiveMinutes: plan.candidate.report.inactiveMinutes }, 'upgrade-applied');
 }
 export function restoreUpgrade(target, requireIdle = requireStopped) {
   requireIdle();
@@ -92,11 +93,11 @@ export function restoreUpgrade(target, requireIdle = requireStopped) {
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    const [command, target, argument] = process.argv.slice(2);
-    check(['inspect', 'apply', 'restore'].includes(command) && target && [4, 5].includes(process.argv.length) && !(command === 'restore' && argument),
-      '用法：node inplace.mjs inspect|apply <resources/app.asar> [--options=id,id] | restore <resources/app.asar>');
-    const selected = parseOptionsArgument(argument);
-    const result = command === 'inspect' ? inspectUpgrade(target, selected) : command === 'apply' ? applyUpgrade(target, requireStopped, selected) : restoreUpgrade(target);
+    const [command, target, ...arguments_] = process.argv.slice(2);
+    check(['inspect', 'apply', 'restore'].includes(command) && target && !(command === 'restore' && arguments_.length),
+      '用法：node inplace.mjs inspect|apply <resources/app.asar> [--options=id,id] [--inactive-minutes=5] | restore <resources/app.asar>');
+    const { selected, inactiveMinutes } = parsePatchArguments(arguments_);
+    const result = command === 'inspect' ? inspectUpgrade(target, selected, inactiveMinutes) : command === 'apply' ? applyUpgrade(target, requireStopped, selected, inactiveMinutes) : restoreUpgrade(target);
     console.log(JSON.stringify(result, null, 2));
   } catch (error) { console.error(`ERROR: ${error.message}`); process.exitCode = 1; }
 }
