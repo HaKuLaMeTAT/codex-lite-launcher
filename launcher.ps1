@@ -1,5 +1,5 @@
 ﻿param([switch]$SmokeTest, [string]$TargetPath, [string]$ScreenshotPath,
-    [ValidateSet('copy','inplace')][string]$Mode = 'copy', [string]$SelectedOptions = 'all',
+    [ValidateSet('copy','inplace')][string]$Mode = 'copy', [string]$SelectedOptions = 'default',
     [ValidateRange(1,180)][int]$InactiveMinutes = 5)
 
 $ErrorActionPreference = 'Stop'
@@ -31,7 +31,7 @@ function Find-Installation {
 }
 
 $form = New-Object Windows.Forms.Form
-$form.Text = 'Codex 轻启 v0.10.0'
+$form.Text = 'Codex 轻启 v0.11.0'
 $form.ClientSize = New-Object Drawing.Size(720, 750)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
@@ -71,11 +71,11 @@ $outputBrowse.Text = '副本位置'
 $outputBrowse.SetBounds(596, 195, 101, 32)
 $form.Controls.Add($outputBrowse)
 
-# 从共享目录读取选项，界面与命令行使用相同标识；默认全选。
+# 从共享目录读取默认值；基础六项默认选中，后续运行时优化按需勾选。
 # Windows PowerShell 5.1 的 ConvertFrom-Json 将数组作为单个管道对象输出，直接赋值避免再包一层。
 $optionDefinitions = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'options.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $optionLabel = New-Object Windows.Forms.Label
-$optionLabel.Text = '性能优化项（默认全选）'
+$optionLabel.Text = '性能优化项（默认基础 6 项）'
 $optionLabel.SetBounds(22, 236, 315, 24)
 $form.Controls.Add($optionLabel)
 $retentionLabel = New-Object Windows.Forms.Label
@@ -92,9 +92,9 @@ $optionList.CheckOnClick = $true
 $optionList.MultiColumn = $true
 $optionList.ColumnWidth = 332
 $optionList.IntegralHeight = $false
-$optionList.SetBounds(22, 264, 675, 145)
+$optionList.SetBounds(22, 264, 675, 156)
 foreach ($option in $optionDefinitions) {
-    $checked = $SelectedOptions -eq 'all' -or ($SelectedOptions -split ',') -contains $option.id
+    $checked = $SelectedOptions -eq 'all' -or ($SelectedOptions -eq 'default' -and $option.default) -or ($SelectedOptions -split ',') -contains $option.id
     [void]$optionList.Items.Add($option.label, $checked)
 }
 $form.Controls.Add($optionList)

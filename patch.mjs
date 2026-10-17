@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { executableIntegrity, headerHash, updateExecutable } from './exe-integrity.mjs';
 import { transformRuntime, transformInactiveThreads, transformInactiveViewLease, transformAppToolsLaunch, transformSharedAppTools } from './runtime-patches.mjs';
+import { transformGitSnapshotScheduling, transformReducedMotion } from './performance-patches.mjs';
 import { normalizeOptions, selectedEdits, normalizeInactiveMinutes } from './options.mjs';
 
 const acorn = createRequire(import.meta.url)('./vendor/acorn.cjs');
@@ -213,7 +214,7 @@ function verifyLegacy(main, checkout) {
   });
   for (const [name, found] of Object.entries(matches)) only(found, `旧补丁 ${name}`);
 }
-function buildArchive(original, runtime, selected, revision = 8, inactiveMinutes = 5) {
+function buildArchive(original, runtime, selected, revision = 9, inactiveMinutes = 5) {
   inactiveMinutes = normalizeInactiveMinutes(inactiveMinutes);
   const options = normalizeOptions(selected), enabled = runtime ? selectedEdits(options) : ['avatar', 'hotkey', 'detached', 'menu', 'checkout-pricing', 'checkout-credit'];
   const { a, pkg, main, checkout } = modules(original, enabled.some(id => id.startsWith('checkout-')));
@@ -236,6 +237,12 @@ function buildArchive(original, runtime, selected, revision = 8, inactiveMinutes
       put(main, transformAppToolsLaunch((replacements.get(main) ?? a.entry(main).bytes).toString()));
     if (revision >= 8 && options.includes('app-tools-shared-host'))
       put(main, transformSharedAppTools((replacements.get(main) ?? a.entry(main).bytes).toString()));
+    if (revision >= 9 && options.includes('serialized-git-snapshots')) {
+      const name = only([...a.entries.keys()].filter(n => n === '.vite/build/worker.js'), 'Git worker 模块');
+      put(name, transformGitSnapshotScheduling(a.entry(name).bytes.toString()));
+    }
+    if (revision >= 9 && options.includes('reduced-motion'))
+      put(main, transformReducedMotion((replacements.get(main) ?? a.entry(main).bytes).toString()));
     const groups = { main: ['batched-pty-output'], initial: ['settled-stream-text', 'coalesced-mcp-inventory'], shared: ['command-output-items', 'cached-highlight-language', 'highlight-timer-cleanup'] };
     for (const [kind, ids] of Object.entries(groups)) {
       if (!ids.some(id => enabled.includes(id))) continue;
@@ -266,8 +273,8 @@ function buildArchive(original, runtime, selected, revision = 8, inactiveMinutes
 }
 // 原位安装/恢复保留旧算法，确保已安装 v0.3 的配套哈希仍可验证。
 export function buildPatch(original) { return buildArchive(original, false); }
-export function buildOptimizedPatch(original, selected, revision = 8, inactiveMinutes = 5) { return buildArchive(original, true, selected, revision, inactiveMinutes); }
-export function buildOptimizedInstallation(original, originalExe, selected, revision = 8, inactiveMinutes = 5) {
+export function buildOptimizedPatch(original, selected, revision = 9, inactiveMinutes = 5) { return buildArchive(original, true, selected, revision, inactiveMinutes); }
+export function buildOptimizedInstallation(original, originalExe, selected, revision = 9, inactiveMinutes = 5) {
   const candidate = buildOptimizedPatch(original, selected, revision, inactiveMinutes), executable = updateExecutable(originalExe, original, candidate.bytes);
   return { asar: candidate.bytes, exe: executable.bytes, report: { ...candidate.report,
     sourceExeSha256: sha256(originalExe), candidateExeSha256: sha256(executable.bytes),
@@ -341,9 +348,9 @@ export function resolveUpgrade(target, selected, forRestore = false, inactiveMin
   let installedInactiveMinutes = normalizeInactiveMinutes(saved?.inactiveMinutes ?? 5);
   const previousInactiveMinutes = normalizeInactiveMinutes(saved?.previousInactiveMinutes ?? 5);
   const options = forRestore ? installedOptions : normalizeOptions(selected);
-  const candidate = buildOptimizedInstallation(original, originalExe, options, 8, forRestore ? installedInactiveMinutes : inactiveMinutes);
+  const candidate = buildOptimizedInstallation(original, originalExe, options, 9, forRestore ? installedInactiveMinutes : inactiveMinutes);
   let installedRevision = saved?.revision ?? 5;
-  check([5, 6, 7, 8].includes(installedRevision) && (saved?.previousRevision === undefined || [5, 6, 7, 8].includes(saved.previousRevision)), '不支持的补丁算法版本。');
+  check([5, 6, 7, 8, 9].includes(installedRevision) && (saved?.previousRevision === undefined || [5, 6, 7, 8, 9].includes(saved.previousRevision)), '不支持的补丁算法版本。');
   // 旧记录没有算法版本，按 v0.8.0 重建校验；选项相同也不能误用新版哈希。
   const installed = atBaseline || installedRevision === candidate.report.patchVersion && JSON.stringify(options) === JSON.stringify(installedOptions) && installedInactiveMinutes === candidate.report.inactiveMinutes
     ? candidate : buildOptimizedInstallation(original, originalExe, installedOptions, installedRevision, installedInactiveMinutes);

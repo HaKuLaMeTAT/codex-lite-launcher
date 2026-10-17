@@ -103,7 +103,7 @@ export function createCopy(target, destination, selected, inactiveMinutes) {
     fs.copyFileSync(from, to, fs.constants.COPYFILE_EXCL);
     records.push({ path: name, size: fs.statSync(to).size, sha256: hashFile(to) });
   }
-  const manifest = { format: 1, toolVersion: '0.10.0', appVersion: VERSION, createdAt: new Date().toISOString(), selectedOptions: source.candidate.report.selectedOptions, inactiveMinutes: source.candidate.report.inactiveMinutes,
+  const manifest = { format: 1, toolVersion: '0.11.0', appVersion: VERSION, createdAt: new Date().toISOString(), selectedOptions: source.candidate.report.selectedOptions, inactiveMinutes: source.candidate.report.inactiveMinutes,
     sourceRoot: source.root, sourceState: source.state, sourceAsarSha256: source.candidate.report.sourceSha256,
     sourceExeSha256: source.candidate.report.sourceExeSha256, candidateAsarSha256: source.candidate.report.candidateSha256,
     candidateExeSha256: source.candidate.report.candidateExeSha256, launchArguments: ['--disable-features=NonBlockingOsClipboardReads'],

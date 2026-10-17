@@ -4,7 +4,7 @@
 
 Optional performance patches for the Windows Codex desktop app. Reduce hidden-window preloading, batch frequent output and refresh events, and avoid unnecessary background work.
 
-- **Choose your optimizations**: 14 options, all enabled by default, with a configurable inactive-session timeout.
+- **Choose your optimizations**: 16 options. Only the six v0.3.0 baseline options are enabled by default; the later eight runtime options and two new experiments require explicit selection.
 - **Two deployment modes**: patch an existing installation in place or create a separate optimized copy.
 - **Rollback support**: in-place upgrades retain paired backups and a record of selected options.
 - **Source only**: run locally with Node.js and PowerShell; no npm dependency installation required.
@@ -72,7 +72,7 @@ Once generation finishes, exit other Codex desktop processes and double-click `�
 
 ## Available optimizations
 
-All options are enabled by default. Both modes use the same patch logic. Deselected options skip their code transformations and corresponding match checks.
+Only the first six options in the table are enabled by default. The later eight runtime options remain available but start unchecked, as do the new Git scheduling and reduced-motion options. Both modes use the same patch logic. Deselected options skip their code transformations and corresponding match checks.
 
 | Optimization | Behavior and trade-off |
 |---|---|
@@ -90,8 +90,10 @@ All options are enabled by default. Both modes use the same patch logic. Deselec
 | Launch app tools directly with Node | Bypasses the CMD wrapper for local Windows app tools while preserving permissions, environment, and tools; leaves WSL unchanged |
 | Unsubscribe inactive sessions after a timeout | Defaults to 5 minutes; accepts 1–180 minutes and retains the original release checks; reopening may recreate tools |
 | Share the app-tools channel | Local Windows `codex_app` connections use the existing desktop main process, removing per-session Node/CMD adapters while retaining the original handlers and approval configuration |
+| Serialize Git snapshots per repository | Serializes turn-diff temporary-index snapshots for each repository, shares concurrent requests for the same generation, and rejects stale queued work before starting; completed results are not cached |
+| Reduce interface motion (experimental) | Sets Chromium’s reduced-motion preference in the main process so existing renderer paths can use simpler effects; visual motion may decrease, and CPU savings have not been measured |
 
-When you switch away, the hidden page releases its active-session lease while its content can remain cached. Returning reacquires the lease. The inactivity timer no longer waits for the roughly 10-minute page cache to expire first.
+With the inactive-session option selected, switching away makes the hidden page releases its active-session lease while its content can remain cached. Returning reacquires the lease. The inactivity timer no longer waits for the roughly 10-minute page cache to expire first.
 
 With the session option enabled, **会话保留** (Session retention) accepts **integer minutes from 1 to 180, defaulting to 5**. Deselect the option to keep the original 3-hour policy. On startup, the GUI reads the timeout from the selected installation record; an explicit `-InactiveMinutes` argument takes precedence. Change the value and apply directly without manually checking again. Exit Codex, apply the patch, and restart for it to take effect.
 
@@ -99,9 +101,13 @@ The timeout is saved alongside the selected options in the installation record o
 
 The shared channel applies only to standard local Windows app-tools configurations. Each list or call reads the current desktop catalog and dispatches through the original handlers. The existing backend connects to a loopback-only HTTP endpoint with a random credential; the app's existing synchronization flow updates the local plugin configuration. WSL, remote-executor exports, and custom launch arguments retain their original paths. When both app-tools options are selected, the shared channel takes precedence for standard local configurations.
 
-CUA, REPL, and code-review services do not use the shared channel. This does not make every MCP server start on first use. The default timeout remains 5 minutes; increasing it can reduce session recreation while retaining other tools for longer.
+CUA, REPL, and code-review services do not use the shared channel. This does not make every MCP server start on first use. With inactive-session unsubscription enabled, the default timeout is 5 minutes; increasing it can reduce session recreation while retaining other tools for longer.
 
 **Unsubscribing does not guarantee immediate tool-process exit.** The backend still controls actual cleanup. The [official SessionEnd documentation](https://learn.chatgpt.com/docs/hooks#sessionend) describes an idle cleanup period of about 30 minutes without connected clients; this is not a measured exit deadline for the installed binary. After cleanup, reopening a session may need to recreate tools, and in-memory state such as REPL variables is not guaranteed to survive. The tool does not forcibly kill processes or delete conversation history. This option does not defer tool startup until its first invocation.
+
+Git scheduling applies only to turn-diff snapshots. It does not disable Git status, review, staging, or commits, change the user index, or reduce every background scan. The original query cache already deduplicates same-generation requests; the new scheduler primarily limits overlap across generations. Large, frequently changing repositories can still consume CPU, and new work must wait for earlier work to finish.
+
+Reduced motion uses a main-process startup switch to affect renderer paths that respect `prefers-reduced-motion`. It substantially overlaps with the app’s Reduce motion setting, while additionally affecting paths that read the browser media preference directly. Explicitly disabling reduced motion in app settings can produce inconsistent behavior between these paths. Prefer the built-in setting first. It is not a fix for main-process CPU hotspots and does not guarantee fewer processes or lower memory. Function-level CPU profiles of the main process and renderers have not yet been captured, so other main-process behavior has not been changed on that basis.
 
 See [options.json](options.json) for option IDs. Selecting none adds no optimizations: in-place mode leaves a clean installation unchanged and creates no backups; copy mode still copies the runtime files.
 
@@ -151,7 +157,7 @@ node .\copy.mjs create 'C:\Apps\Codex\app\resources\app.asar' 'C:\Apps\Codex-opt
 node .\copy.mjs verify 'C:\Apps\Codex-optimized'
 ```
 
-Omitting `--options` selects all optimizations. Inspection, application, and generation commands accept comma-separated option IDs; `--options=none` selects none. Rollback and copy verification do not accept option arguments.
+Omitting `--options` selects only the six baseline options. Use `--options=all` to explicitly select everything, including experiments. Inspection, application, and generation commands accept comma-separated option IDs; `--options=none` selects none. Rollback and copy verification do not accept option arguments.
 
 Inspection, application, and generation also accept `--inactive-minutes=15`, defaulting to 5 when omitted. It changes the session policy only when `inactive-thread-unsubscribe` is selected. To set the GUI's initial value, run `powershell -File .\launcher.ps1 -InactiveMinutes 15`.
 
@@ -161,7 +167,10 @@ node .\inplace.mjs inspect 'C:\Apps\Codex\app\resources\app.asar' --options=menu
 node .\inplace.mjs apply 'C:\Apps\Codex\app\resources\app.asar' --options=menu,batched-pty-output
 
 # Select all optimizations and retain inactive sessions for 15 minutes
-node .\inplace.mjs apply 'C:\Apps\Codex\app\resources\app.asar' --inactive-minutes=15
+node .\inplace.mjs apply 'C:\Apps\Codex\app\resources\app.asar' --options=all --inactive-minutes=15
+
+# Baseline six plus Git scheduling, without the other runtime options
+node .\inplace.mjs inspect 'C:\Apps\Codex\app\resources\app.asar' --options=avatar,hotkey,detached,checkout-pricing,checkout-credit,menu,serialized-git-snapshots
 
 # Run automated tests
 npm test
@@ -172,7 +181,7 @@ $env:CODEX_TEST_ASAR = 'C:\Apps\Codex\app\resources\app.asar'
 npm test
 ```
 
-Option names and dependencies are maintained in [options.json](options.json). Core transformations live in [patch.mjs](patch.mjs) and [runtime-patches.mjs](runtime-patches.mjs). See [VALIDATION.md](VALIDATION.md) (Chinese) for completed checks and remaining coverage gaps. Syntax, structural, and startup checks do not replace full desktop feature acceptance testing.
+Option names and dependencies are maintained in [options.json](options.json). Core transformations live in [patch.mjs](patch.mjs), [runtime-patches.mjs](runtime-patches.mjs), and [performance-patches.mjs](performance-patches.mjs). See [VALIDATION.md](VALIDATION.md) (Chinese) for completed checks and remaining coverage gaps. Syntax, structural, and startup checks do not replace full desktop feature acceptance testing.
 
 ## Credits and license
 

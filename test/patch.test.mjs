@@ -10,9 +10,11 @@ import { inspectUpgrade, applyUpgrade, restoreUpgrade } from '../inplace.mjs';
 import { UPGRADE_BACKUP_SUFFIX, rewriteArchive } from '../patch.mjs';
 import { executableIntegrity, headerHash, updateExecutable } from '../exe-integrity.mjs';
 import { createCopy, inspectSource, verifyCopy, hashFile, MANIFEST } from '../copy.mjs';
-import { OPTIONS, normalizeOptions, parseOptionsArgument, parsePatchArguments } from '../options.mjs';
+import { OPTIONS, DEFAULT_OPTIONS, ALL_OPTIONS, normalizeOptions, parseOptionsArgument, parsePatchArguments } from '../options.mjs';
 import { SELECTION_FILE, UNRECORDED_OPTIONS } from '../patch.mjs';
 import acorn from '../vendor/acorn.cjs';
+import { createSnapshotScheduler, transformGitSnapshotScheduling, transformReducedMotion } from '../performance-patches.mjs';
+import { execFileSync } from 'node:child_process';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { createSharedAppToolsHost, sharedAppToolsConfig } from '../app-tools-host.mjs';
@@ -163,12 +165,16 @@ const pageLease = `function page({view,active}) {
  return cache[1];
 }`;
 
+const gitWorker = 'function capture(repo){let snapshot=repo.reviewSnapshot;return repo.queryClient.fetchQuery({queryKey:key(repo.root,repo.host,`turn-diff-snapshot-tree`,`${snapshot.generation}`),gcTime:250,queryFn:()=>snapshot.read(()=>makeTree(repo,snapshot.signal)),staleTime:0})}';
+const OLD_OPTIONS = ALL_OPTIONS.filter(id => !['serialized-git-snapshots', 'reduced-motion'].includes(id));
+
 function fixture(version = VERSION) {
   const files = new Map([
     ['package.json', JSON.stringify({ name: 'openai-codex-electron', version })],
-    ['.vite/build/main-renamed.js', main + appToolsFactory + sharedAppTools], ['webview/assets/webview-page-renamed.js', checkout],
+    ['.vite/build/main-renamed.js', 'const electron = require("electron");\n' + main + appToolsFactory + sharedAppTools], ['webview/assets/webview-page-renamed.js', checkout],
     ['webview/assets/app-initial-renamed.js', initial], ['webview/assets/app-shared-renamed.js', shared + lifecycle],
     ['.vite/build/bootstrap-renamed.js', lifecycle],
+    ['.vite/build/worker.js', gitWorker],
     ['webview/assets/app-primary-renamed.js', pageLease],
     ['unrelated.txt', 'preserve custom screenshot patch and settings'],
   ]);
@@ -214,7 +220,8 @@ test('renamed modules and non-baseline package work; all other data and unpacked
   verifyContents(original, result.bytes, result.report.modules);
   assert.throws(() => buildPatch(fixture('99.0.0')), /暂不支持版本/);
   const corrupted = Buffer.from(original);
-  corrupted[readArchive(original).entry('.vite/build/main-renamed.js').start + 3] ^= 1;
+  const entry = readArchive(original).entry('.vite/build/main-renamed.js');
+  corrupted[entry.start + entry.bytes.indexOf(Buffer.from('中文'))] ^= 1;
   assert.throws(() => buildPatch(corrupted), /摘要校验失败/);
 });
 
@@ -316,15 +323,15 @@ test('independent copy uses original or verified backups, preserves source and r
   }
 });
 
-test('real ASAR: six modules, lifecycle scheduling, packed files and external metadata verify', {
+test('real ASAR: seven modules, lifecycle scheduling, packed files and external metadata verify', {
   skip: !process.env.CODEX_TEST_ASAR,
 }, () => {
   const minutes = Number(process.env.CODEX_TEST_INACTIVE_MINUTES ?? 5);
-  const source = sourceForCopy(process.env.CODEX_TEST_ASAR, undefined, minutes);
+  const source = sourceForCopy(process.env.CODEX_TEST_ASAR, ALL_OPTIONS, minutes);
   const original = fs.readFileSync(source.asarInput), result = { bytes: source.candidate.asar, report: source.candidate.report };
-  assert.equal(result.report.patchVersion, 8);
-  assert.equal(result.report.modules.length, 6);
-  assert.equal(result.report.changes.length, 17);
+  assert.equal(result.report.patchVersion, 9);
+  assert.equal(result.report.modules.length, 7);
+  assert.equal(result.report.changes.length, 19);
   verifyContents(original, result.bytes, result.report.modules);
   const originalExe = fs.readFileSync(source.exeInput);
   const resource = executableIntegrity(originalExe), patchedExe = updateExecutable(originalExe, original, result.bytes).bytes;
@@ -396,13 +403,13 @@ test('in-place upgrade and rollback preserve original/legacy pairs and support c
       const original = fixture(); fs.writeFileSync(target, original); fs.writeFileSync(exe, exeFixture(original));
       if (legacy) install(target, () => {});
       const before = [target, exe].map(hashFile);
-      assert.throws(() => applyUpgrade(target, () => { throw Error('running'); }), /running/);
+      assert.throws(() => applyUpgrade(target, () => { throw Error('running'); }, OLD_OPTIONS), /running/);
       assert.equal(fs.existsSync(target + UPGRADE_BACKUP_SUFFIX), false);
       // 模拟只完成第一份备份即中断，再次升级应补齐另一份。
       fs.copyFileSync(target, target + UPGRADE_BACKUP_SUFFIX);
-      assert.equal(applyUpgrade(target, () => {}).state, 'upgraded');
+      assert.equal(applyUpgrade(target, () => {}, OLD_OPTIONS).state, 'upgraded');
       assert.equal(inspectUpgrade(target).state, 'upgraded');
-      assert.equal(applyUpgrade(target, () => {}).state, 'upgraded');
+      assert.equal(applyUpgrade(target, () => {}, OLD_OPTIONS).state, 'upgraded');
       assert.deepEqual([target, exe].map(f => hashFile(f + UPGRADE_BACKUP_SUFFIX)), before);
       if (legacy) {
         assert.ok(fs.readFileSync(target + BACKUP_SUFFIX).equals(original));
@@ -411,13 +418,13 @@ test('in-place upgrade and rollback preserve original/legacy pairs and support c
         assert.equal(inspectUpgrade(target).canRestore, true);
       }
       const output = path.join(directory, 'copy-' + legacy);
-      createCopy(target, output);
+      createCopy(target, output, OLD_OPTIONS);
       assert.equal(hashFile(path.join(output, 'resources', 'app.asar')), hashFile(target));
       assert.equal(hashFile(path.join(output, 'ChatGPT.exe')), hashFile(exe));
       assert.equal(fs.existsSync(path.join(output, 'ChatGPT.exe' + UPGRADE_BACKUP_SUFFIX)), false);
       restoreUpgrade(target, () => {});
       assert.deepEqual([target, exe].map(hashFile), before);
-      applyUpgrade(target, () => {});
+      applyUpgrade(target, () => {}, OLD_OPTIONS);
       fs.appendFileSync(exe, 'unknown');
       assert.throws(() => restoreUpgrade(target, () => {}), /未知后续修改/);
     }
@@ -439,22 +446,22 @@ test('in-place interrupted replacement can roll back and preflight failures neve
     fs.unlinkSync(target + BACKUP_SUFFIX); fs.unlinkSync(exe + BACKUP_SUFFIX);
     const before = [target, exe].map(hashFile);
     fs.statfsSync = () => ({ bavail: 0, bsize: 4096 });
-    assert.throws(() => applyUpgrade(target, () => {}), /磁盘空间不足/);
+    assert.throws(() => applyUpgrade(target, () => {}, OLD_OPTIONS), /磁盘空间不足/);
     fs.statfsSync = statfs;
     assert.equal(fs.existsSync(target + UPGRADE_BACKUP_SUFFIX), false);
     let checks = 0;
-    assert.throws(() => applyUpgrade(target, () => { if (++checks === 2) throw Error('running again'); }), /running again/);
+    assert.throws(() => applyUpgrade(target, () => { if (++checks === 2) throw Error('running again'); }, OLD_OPTIONS), /running again/);
     assert.equal(fs.existsSync(path.join(directory, SELECTION_FILE)), false);
     assert.deepEqual([target, exe].map(hashFile), before);
     fs.renameSync = (from, to) => { if (to === exe) throw Error('injected'); return rename(from, to); };
-    assert.throws(() => applyUpgrade(target, () => {}), /替换未完成.*injected/);
+    assert.throws(() => applyUpgrade(target, () => {}, OLD_OPTIONS), /替换未完成.*injected/);
     fs.renameSync = rename;
     assert.equal(inspectUpgrade(target).state, 'partial');
-    assert.throws(() => applyUpgrade(target, () => {}), /半完成/);
+    assert.throws(() => applyUpgrade(target, () => {}, OLD_OPTIONS), /半完成/);
     restoreUpgrade(target, () => {});
     assert.deepEqual([target, exe].map(hashFile), before);
     fs.writeFileSync(exe + '.lite-v5.tmp', 'unknown');
-    assert.throws(() => applyUpgrade(target, () => {}), /临时文件内容未知/);
+    assert.throws(() => applyUpgrade(target, () => {}, OLD_OPTIONS), /临时文件内容未知/);
     assert.deepEqual([target, exe].map(hashFile), before);
   } finally {
     fs.renameSync = rename; fs.statfsSync = statfs;
@@ -480,7 +487,12 @@ test('incremental legacy upgrade matches clean build and rejects damaged legacy 
 
 test('selectable optimizations cover individual choices, disabled matchers and grouped cleanup', () => {
   const original = fixture();
-  assert.ok(buildOptimizedPatch(original).bytes.equals(buildOptimizedPatch(original, OPTIONS.map(o => o.id)).bytes));
+  assert.deepEqual(normalizeOptions(), DEFAULT_OPTIONS);
+  assert.equal(DEFAULT_OPTIONS.length, 6); assert.equal(OLD_OPTIONS.length - DEFAULT_OPTIONS.length, 8);
+  assert.ok(buildOptimizedPatch(original).bytes.equals(buildPatch(original).bytes));
+  assert.deepEqual(buildOptimizedPatch(original).report.selectedOptions, DEFAULT_OPTIONS);
+  assert.deepEqual(parseOptionsArgument('--options=all'), ALL_OPTIONS);
+  assert.deepEqual(normalizeOptions(parseOptionsArgument()), DEFAULT_OPTIONS);
   assert.ok(buildOptimizedPatch(original, []).bytes.equals(original));
   for (const option of OPTIONS) {
     const result = buildOptimizedPatch(original, [option.id]);
@@ -500,6 +512,96 @@ test('selectable optimizations cover individual choices, disabled matchers and g
   assert.throws(() => parseOptionsArgument('--options='), /未知/);
 });
 
+test('Git snapshot scheduling preserves query options and rejects changed structures', async () => {
+  const transformed = transformGitSnapshotScheduling(gitWorker).bytes.toString();
+  const repository = { root: 'repo', host: 'local' }, snapshot = {
+    generation: 1, signal: {}, assertCurrent() { assert.equal(repository.reviewSnapshot, this); },
+    read(run) { this.assertCurrent(); return run(); },
+  };
+  repository.reviewSnapshot = snapshot;
+  repository.queryClient = { fetchQuery: async query => {
+    assert.equal(query.gcTime, 250); assert.equal(query.staleTime, 0);
+    assert.deepEqual(Array.from(query.queryKey), ['repo', 'local', 'turn-diff-snapshot-tree', '1']);
+    return query.queryFn();
+  } };
+  const capture = vm.runInNewContext(transformed + ';capture', {
+    key: (...args) => args, makeTree: (repo, signal) => {
+      assert.equal(repo, repository); assert.equal(signal, snapshot.signal); return 'tree';
+    },
+  });
+  assert.equal(await capture(repository), 'tree');
+  assert.equal(transformGitSnapshotScheduling(gitWorker.replaceAll('repo', 'renamed')).edits.length, 1);
+  assert.throws(() => transformGitSnapshotScheduling(transformed), /已包含/);
+  assert.throws(() => transformGitSnapshotScheduling(gitWorker.replace('gcTime:250', 'gcTime:500')), /唯一匹配/);
+  assert.throws(() => transformGitSnapshotScheduling(gitWorker + gitWorker.replace('capture(', 'other(')), /唯一匹配/);
+});
+
+test('snapshot queue shares in-flight work, isolates repositories, rejects stale work and recovers failures', async () => {
+  const schedule = createSnapshotScheduler(), repo = {}, other = {};
+  let release, started = [];
+  const first = { assertCurrent() {} }, stale = { assertCurrent() { throw Error('stale'); } }, next = { assertCurrent() {} };
+  const gate = new Promise(resolve => { release = resolve; });
+  const a = schedule(repo, first, async () => { started.push('first'); await gate; throw Error('git failed'); });
+  assert.equal(schedule(repo, first, () => assert.fail('duplicate')), a);
+  const rejected = schedule(repo, stale, () => assert.fail('stale Git must never start'));
+  const b = schedule(repo, next, async () => { started.push('next'); return 'fresh'; });
+  const aCheck = assert.rejects(a, /git failed/), staleCheck = assert.rejects(rejected, /stale/);
+  assert.equal(await schedule(other, first, async () => 'independent'), 'independent');
+  assert.deepEqual(started, ['first']);
+  release(); await Promise.all([aCheck, staleCheck]);
+  assert.equal(await b, 'fresh'); assert.deepEqual(started, ['first', 'next']);
+  assert.equal(await schedule(repo, next, async () => 'changed'), 'changed');
+});
+
+test('serialized snapshots with real Git preserve tree contents and the user index', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-perf-test-'));
+  const git = (args, env = {}) => execFileSync('git', args, { cwd: directory,
+    env: { ...process.env, ...env }, windowsHide: true, encoding: 'utf8' }).trim();
+  try {
+    git(['init', '--quiet']); fs.writeFileSync(path.join(directory, 'tracked.txt'), 'base');
+    git(['add', '--', 'tracked.txt']); const indexBefore = fs.readFileSync(path.join(directory, '.git', 'index'));
+    fs.writeFileSync(path.join(directory, 'tracked.txt'), 'changed');
+    fs.writeFileSync(path.join(directory, '中文.txt'), 'untracked');
+    const schedule = createSnapshotScheduler(), repo = {}, snapshots = [0, 1].map(generation => ({ generation, assertCurrent() {} }));
+    let release, active = 0, maximum = 0;
+    const gate = new Promise(resolve => { release = resolve; });
+    const run = async snapshot => {
+      maximum = Math.max(maximum, ++active);
+      try {
+        if (!snapshot.generation) await gate;
+        const env = { GIT_INDEX_FILE: path.join(directory, '.git', 'temporary-index-' + snapshot.generation) };
+        git(['read-tree', '--empty'], env); git(['add', '-A', '--', '.'], env);
+        return git(['write-tree'], env);
+      } finally { active--; }
+    };
+    const first = schedule(repo, snapshots[0], () => run(snapshots[0]));
+    const second = schedule(repo, snapshots[1], () => run(snapshots[1]));
+    await Promise.resolve(); assert.equal(active, 1); release();
+    const [a, b] = await Promise.all([first, second]); assert.equal(maximum, 1); assert.equal(a, b);
+    assert.equal(git(['show', a + ':tracked.txt']), 'changed');
+    assert.equal(git(['show', a + ':中文.txt']), 'untracked');
+    assert.ok(fs.readFileSync(path.join(directory, '.git', 'index')).equals(indexBefore));
+  } finally {
+    const relative = path.relative(fs.realpathSync(os.tmpdir()), fs.realpathSync(directory));
+    assert.ok(!relative.startsWith('..') && !path.isAbsolute(relative) && relative.startsWith('codex-perf-test-'));
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('reduced motion is opt-in and sets the native preference before main startup', () => {
+  const source = '"use strict";const electron=require("electron");startup();', calls = [];
+  assert.ok(transformReducedMotion(source).bytes.toString().startsWith('"use strict";'));
+  assert.ok(transformGitSnapshotScheduling('"use strict";' + gitWorker).bytes.toString().startsWith('"use strict";'));
+  vm.runInNewContext(transformReducedMotion(source).bytes.toString(), {
+    require: name => { assert.equal(name, 'electron'); return { app: { commandLine: { appendSwitch: value => calls.push(value) } } }; },
+    startup: () => calls.push('startup'),
+  });
+  assert.deepEqual(calls, ['force-prefers-reduced-motion', 'startup']);
+  assert.throws(() => transformReducedMotion('startup()'), /唯一匹配/);
+  assert.throws(() => transformReducedMotion(transformReducedMotion(source).bytes.toString()), /已包含/);
+  assert.throws(() => transformReducedMotion(source + 'require("electron");'), /唯一匹配/);
+});
+
 test('selected installation records survive restart, partial replacement and option-independent rollback', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-perf-test-'));
   const root = path.join(directory, 'source'), target = path.join(root, 'resources', 'app.asar'), exe = path.join(root, 'ChatGPT.exe');
@@ -511,7 +613,7 @@ test('selected installation records survive restart, partial replacement and opt
     const before = [target, exe].map(hashFile);
     applyUpgrade(target, () => {}, []);
     assert.equal(fs.existsSync(target + UPGRADE_BACKUP_SUFFIX), false);
-    const selected = ['menu', 'cached-highlight-language'];
+    const selected = ['menu', 'cached-highlight-language', 'serialized-git-snapshots', 'reduced-motion'];
     applyUpgrade(target, () => {}, selected);
     assert.equal(inspectUpgrade(target, selected).matchesSelection, true);
     assert.equal(inspectUpgrade(target).matchesSelection, false);
@@ -663,8 +765,8 @@ test('runtime transforms reject incomplete, duplicate and already patched module
     assert.throws(() => transformRuntime(transformRuntime(source, kind).bytes.toString(), kind), /已包含/);
     assert.throws(() => transformRuntime(source + '\n{' + source + '\n}', kind), /唯一匹配/);
   }
-  const original = fixture(), result = buildOptimizedPatch(original);
-  assert.equal(result.report.modules.length, 6); assert.equal(result.report.changes.length, 17);
+  const original = fixture(), result = buildOptimizedPatch(original, ALL_OPTIONS);
+  assert.equal(result.report.modules.length, 7); assert.equal(result.report.changes.length, 19);
   verifyContents(original, result.bytes, result.report.modules);
 });
 
@@ -785,13 +887,13 @@ test('0.8.x and 0.9.x upgrades reuse baseline and recover cross-revision interru
   const rename = fs.renameSync;
   try {
     fs.mkdirSync(path.dirname(target));
-    const original = fixture(), originalExe = exeFixture(original), options = OPTIONS.map(o => o.id);
+    const original = fixture(), originalExe = exeFixture(original), options = OLD_OPTIONS;
     const baseline = [sha256(original), sha256(originalExe)];
     fs.writeFileSync(target + UPGRADE_BACKUP_SUFFIX, original);
     fs.writeFileSync(exe + UPGRADE_BACKUP_SUFFIX, originalExe);
     const backupTimes = [target, exe].map(p => fs.statSync(p + UPGRADE_BACKUP_SUFFIX).mtimeMs);
-    for (const [revision, failingTarget] of [5, 6, 7].flatMap(revision => [null, target, exe].map(target => [revision, target]))) {
-      const oldOptions = options.filter(id => id !== 'app-tools-shared-host' && (revision >= 7 || id !== 'app-tools-direct-node'));
+    for (const [revision, failingTarget] of [5, 6, 7, 8].flatMap(revision => [null, target, exe].map(target => [revision, target]))) {
+      const oldOptions = options.filter(id => (revision >= 8 || id !== 'app-tools-shared-host') && (revision >= 7 || id !== 'app-tools-direct-node'));
       const old = buildOptimizedInstallation(original, originalExe, oldOptions, revision);
       fs.writeFileSync(target, old.asar); fs.writeFileSync(exe, old.exe);
       fs.writeFileSync(path.join(directory, SELECTION_FILE), JSON.stringify({format:1,options:oldOptions,...(revision>=6?{revision}:{}),beforeHashes:baseline}));

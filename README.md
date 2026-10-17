@@ -4,7 +4,7 @@
 
 为 Windows Codex 桌面应用提供可选的性能优化：减少隐藏窗口预加载，合并高频输出和刷新，降低不必要的后台开销。
 
-- **自由选择**：14 项优化默认全选，可分别取消；会话保留时间可配置。
+- **自由选择**：16 项优化，默认只启用 v0.3.0 的基础 6 项；后续 8 项运行时优化及 2 项新实验优化需要手动勾选。
 - **两种模式**：原位升级现有安装，或生成独立优化副本。
 - **可回滚**：原位升级保留配套备份和选项记录。
 - **源码交付**：通过 Node.js 和 PowerShell 运行，无需安装 npm 依赖。
@@ -70,7 +70,7 @@ cd codex-lite-launcher
 
 ## 可选优化
 
-所有选项默认启用，两种模式使用相同的优化逻辑。未勾选项不参与代码变换及对应匹配点检查。
+默认启用下表前 6 项。后续 8 项运行时优化默认关闭，保留供按场景选用；新增 Git 调度与减少动画也默认关闭。两种模式使用相同的优化逻辑。未勾选项不参与代码变换及对应匹配点检查。
 
 | 优化 | 作用与取舍 |
 |---|---|
@@ -88,8 +88,10 @@ cd codex-lite-launcher
 | 应用工具直接启动 Node | Windows 本地应用工具跳过 CMD 包装，保留权限、环境和工具能力；不影响 WSL |
 | 非活跃会话定时取消订阅 | 默认 5 分钟，可设为 1–180 分钟；复用原有安全检查，再次进入可能需要重建工具 |
 | 应用工具共享通道 | Windows 本地 `codex_app` 共用桌面主进程中的工具入口，免去每会话的 Node/CMD 转接进程；保留原工具处理器和审批配置 |
+| 同仓库 Git 快照串行调度 | 同一仓库的回合差异临时索引快照串行执行，同代并发共享在途结果；启动前拒绝过期任务，不缓存已完成结果 |
+| 减少界面动画（实验） | 在主进程启用 Chromium 的减少动画偏好，让现有渲染器动画路径使用精简效果；可能减少视觉动效，CPU 收益尚未实测 |
 
-切走会话时，隐藏页面释放活跃引用，页面内容仍可保留在缓存中；再次进入会话会重新获取引用。这样不必先等页面缓存约 10 分钟后才开始计时。
+勾选会话取消订阅优化后，切走会话时，隐藏页面释放活跃引用，页面内容仍可保留在缓存中；再次进入会话会重新获取引用。这样不必先等页面缓存约 10 分钟后才开始计时。
 
 勾选“非活跃会话定时取消订阅”后，“会话保留”支持 **1–180 的整数分钟，默认 5 分钟**；取消勾选则保留原始的 3 小时策略。GUI 启动时读取所选安装记录的时限；显式传入 `-InactiveMinutes` 时优先使用参数。更改时限后可以直接应用，无需手动重新检查；完全退出 Codex、应用补丁并重新启动后生效。
 
@@ -97,9 +99,13 @@ cd codex-lite-launcher
 
 共享通道仅用于标准 Windows 本地应用工具配置；每次读取目录或调用都使用桌面当前目录，工具业务仍由原处理器完成。它通过仅监听回环地址、带随机凭证的 HTTP 入口连接现有后端；本地插件配置由应用原有同步流程更新。WSL、远程执行器导出和自定义启动参数仍走原路径。与“应用工具直接启动 Node”同时勾选时，本地标准配置优先使用共享通道。
 
-共享通道不覆盖 CUA、REPL 或代码审查服务，也不把所有 MCP 服务改成首次调用时启动。默认时限仍为 5 分钟；调大可以减少会话重建，但也会延长其他工具的驻留时间。
+共享通道不覆盖 CUA、REPL 或代码审查服务，也不把所有 MCP 服务改成首次调用时启动。启用会话取消订阅优化后的默认时限为 5 分钟；调大可以减少会话重建，但也会延长其他工具的驻留时间。
 
 **取消订阅不保证工具进程立即退出。** 后端仍决定实际回收时间；[官方 SessionEnd 说明](https://learn.chatgpt.com/docs/hooks#sessionend)描述了约 30 分钟的无人订阅闲置回收期，这不是对当前二进制的实测退出时限。工具被回收后，再次进入会话可能需要重建，REPL 临时变量等内存状态不保证保留。本工具不强制杀进程，也不删除会话历史；这项优化不等于工具首次调用时才启动。
+
+Git 调度只作用于回合差异快照，不关闭 Git 状态、审查、暂存或提交功能，不修改用户索引，也不减少所有后台扫描。同代并发原本也受查询缓存去重；新增调度主要限制跨代任务重叠。持续变化的大仓库仍可能消耗 CPU，旧任务退出前新任务需要等待。
+
+“减少界面动画”通过主进程启动开关影响遵循 `prefers-reduced-motion` 的渲染路径；它与应用设置中的“减少动画”高度重叠，额外影响直接读取浏览器媒体偏好的路径；应用内显式关闭时，两类路径可能表现不一致。建议优先使用应用自带设置。它不是主进程 CPU 热点修复，也不保证减少子进程或内存。当前尚未取得主进程和渲染器的函数级 CPU profile，未据此改动其他主进程逻辑。
 
 完整选项标识见 [options.json](options.json)。全不选表示不新增优化：对干净安装执行原位操作时不替换文件、不新增备份；副本模式仍复制运行文件。
 
@@ -149,7 +155,7 @@ node .\copy.mjs create 'C:\Apps\Codex\app\resources\app.asar' 'C:\Apps\Codex-opt
 node .\copy.mjs verify 'C:\Apps\Codex-optimized'
 ```
 
-省略 `--options` 时全选。检查、应用和生成命令可指定逗号分隔的选项标识；`--options=none` 表示全不选。回滚与副本校验不接收选项参数。
+省略 `--options` 时仅选择基础 6 项；`--options=all` 显式全选（包含实验项）。检查、应用和生成命令可指定逗号分隔的选项标识；`--options=none` 表示全不选。回滚与副本校验不接收选项参数。
 
 检查、应用和生成命令也支持 `--inactive-minutes=15`，省略时为 5；仅在选中 `inactive-thread-unsubscribe` 时改变会话策略。GUI 可使用 `powershell -File .\launcher.ps1 -InactiveMinutes 15` 指定初值。
 
@@ -159,7 +165,10 @@ node .\inplace.mjs inspect 'C:\Apps\Codex\app\resources\app.asar' --options=menu
 node .\inplace.mjs apply 'C:\Apps\Codex\app\resources\app.asar' --options=menu,batched-pty-output
 
 # 全选优化，将非活跃会话时限设为 15 分钟
-node .\inplace.mjs apply 'C:\Apps\Codex\app\resources\app.asar' --inactive-minutes=15
+node .\inplace.mjs apply 'C:\Apps\Codex\app\resources\app.asar' --options=all --inactive-minutes=15
+
+# 基础六项加 Git 快照调度（不启用其余运行时优化）
+node .\inplace.mjs inspect 'C:\Apps\Codex\app\resources\app.asar' --options=avatar,hotkey,detached,checkout-pricing,checkout-credit,menu,serialized-git-snapshots
 
 # 运行自动化测试
 npm test
@@ -169,7 +178,7 @@ $env:CODEX_TEST_ASAR = 'C:\Apps\Codex\app\resources\app.asar'
 npm test
 ```
 
-选项名称和依赖关系维护在 [options.json](options.json)，核心变换见 [patch.mjs](patch.mjs) 和 [runtime-patches.mjs](runtime-patches.mjs)。已完成的验证和未覆盖范围见 [VALIDATION.md](VALIDATION.md)（中文）。语法、结构及启动检查不能代替完整桌面功能验收。
+选项名称和依赖关系维护在 [options.json](options.json)，核心变换见 [patch.mjs](patch.mjs)、[runtime-patches.mjs](runtime-patches.mjs) 和 [performance-patches.mjs](performance-patches.mjs)。已完成的验证和未覆盖范围见 [VALIDATION.md](VALIDATION.md)（中文）。语法、结构及启动检查不能代替完整桌面功能验收。
 
 ## 来源与许可
 

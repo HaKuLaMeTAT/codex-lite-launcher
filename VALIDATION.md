@@ -1,3 +1,18 @@
+# v0.11.0：基础默认值与 Git 快照调度实验
+
+日期：2026-10-17。算法版本 9；验证过程未替换正式安装。
+
+- 默认选中 v0.3.0 基础六项；v0.3.0 之后的八项运行时优化默认关闭。GUI、CLI 与 API 共用 options.json 默认值；显式 --options=all 选中全部 16 项。安装记录的既有组合仍按其原算法重建，回滚不依赖界面当前默认值。
+- 新增默认关闭的 serialized-git-snapshots：仅包装 Git worker 的 turn-diff-snapshot-tree 查询。当前实现按 host 和规范化 worktree root 缓存仓库对象，调度器以该对象为键串行执行。保留 queryKey、250 ms 查询回收、零 staleTime、原临时索引与取消机制；同代并发共享在途结果，完成后不缓存。排队任务启动前通过原 assertCurrent 拒绝过期代；前一任务失败不阻塞后续任务。
+- 本机既有只读日志中，turn-diff-capture-start / turn_diff_analytics 触发整个工作区的 git add --sparse 临时索引操作，并出现 canceled / Git snapshot became stale。该证据定位了快照调度方向，但不证明所有 Git CPU 开销均由并发引起。新选项不降低所有后台扫描频率，不关闭 Git 功能，也不缓存可能过期的已完成树。
+- 新增默认关闭的 reduced-motion 实验项：主进程初始化时设置 Chromium force-prefers-reduced-motion，复用现有 renderer 的媒体偏好与动画路径。保留模块 use strict 指令。Chromium 开关依据见[官方源代码](https://chromium.googlesource.com/chromium/src/+/refs/tags/145.0.7587.5/ui/gfx/switches.cc)。尚未安装验证动画呈现或测量 CPU 收益。
+- 当前 Windows bootstrap 对打包内 codex.exe 存在直接返回路径，未照搬其他版本的插件运行时递归哈希缓存。未获取主进程和渲染器的函数级 CPU profile，故不将减少动画称为主进程 CPU 热点修复。
+- 31 项普通自动化测试通过，真实 ASAR 专项通过。覆盖默认六项与 v0.3.0 构建字节一致、16 个单项、禁用匹配点、队列去重/跨仓库隔离/过期拦截/失败恢复、真实 Git 临时索引的树内容与用户索引不变、减少动画开关顺序，以及算法 5–8 升级至 9、中断恢复和唯一基线备份。真实 Git 验证在独立临时仓库运行，没有修改用户代码仓库。
+- 沙箱内真实 Git 子进程曾出现退出码 0 但 write-tree 标准输出为空；脱离补丁、单独执行 git --version 也复现了空输出。同一集成测试在沙箱外通过，未为此加入重试或修改补丁运行逻辑；尚未进一步定位该本机子进程输出异常。
+- WinForms 控件验证默认 checkedCount=6、会话分钟输入禁用、16 项可见，并保留原有参数修改、成功提示、回滚和记录回读测试；未显示正式窗口。
+- 对当前正式安装另做只读预检：默认组合返回 2 个模块、6 处变换，候选 EXE/ASAR 与当前文件一致（matchesSelection=true）；没有因此将当前安装标记为已安装 v0.11.0。
+- 真实 26.928.20755 包的全选组合构建涉及 7 个模块、19 处变换，包内内容/元数据以及 EXE 的 ASAR 头部摘要校验通过；在内存中构建，没有生成完整应用副本。未进行补丁安装后的启动、Git 长任务与完整桌面业务验收，未测量本轮前后进程数、内存或 CPU 收益。
+
 # v0.10.0：共享应用工具通道与可配置会话时限
 
 日期：2026-10-17。算法版本 8；本轮验证未替换正式安装。

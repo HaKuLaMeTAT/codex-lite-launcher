@@ -15,6 +15,9 @@ $prefix = $source.Substring(0, $source.IndexOf('[void]$form.ShowDialog()'))
 $prefix = $prefix.Replace('$PSScriptRoot', ("'" + $root.Replace("'", "''") + "'"))
 Invoke-Expression $prefix
 try {
+    Assert-Ui ($optionList.CheckedItems.Count -eq 6) '默认只选基础六项'
+    Assert-Ui (-not $retentionMinutes.Enabled) '默认关闭会话时限优化'
+    Assert-Ui ($optionList.Height -ge [Math]::Ceiling($optionList.Items.Count / 2) * $optionList.ItemHeight) '全部选项应可见'
     $location.Text = 'C:\Example\Codex\resources\app.asar'
     $modeBox.SelectedIndex = 1
     Assert-Ui $applyButton.Enabled '选好来源与模式后应能直接执行'
