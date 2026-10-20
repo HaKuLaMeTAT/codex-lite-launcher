@@ -7,10 +7,13 @@ import { createRequire } from 'node:module';
 import { executableIntegrity, headerHash, updateExecutable } from './exe-integrity.mjs';
 import { transformRuntime, transformInactiveThreads, transformInactiveViewLease, transformAppToolsLaunch, transformSharedAppTools } from './runtime-patches.mjs';
 import { transformGitSnapshotScheduling, transformReducedMotion } from './performance-patches.mjs';
-import { normalizeOptions, selectedEdits, normalizeInactiveMinutes } from './options.mjs';
+import { transformImageInput, transformScrollCleanup } from './compatibility-patches.mjs';
+import { readLaunchConfig, LAUNCH_FILES } from './launch-config.mjs';
+import { normalizeOptions, selectedEdits, normalizeInactiveMinutes, DEFAULT_OPTIONS } from './options.mjs';
 
 const acorn = createRequire(import.meta.url)('./vendor/acorn.cjs');
 export const VERSION = '26.928.20755';
+export const SUPPORTED_VERSIONS = [VERSION, '26.1013.40934'];
 export const MARKER = '/*codex-windows-perf:v2*/';
 export const BACKUP_SUFFIX = '.before-perf-v3';
 export const UPGRADE_BACKUP_SUFFIX = '.before-lite-v5';
@@ -179,7 +182,7 @@ function modules(original, needCheckout = true) {
   const a = readArchive(original), pkg = JSON.parse(a.entry('package.json').bytes);
   check(pkg.name === 'openai-codex-electron', '所选安装包不是 Codex 桌面应用。');
   // 通用定位不等于跨版本验证；新增版本必须先审计再加入支持范围。
-  check(pkg.version === VERSION, `暂不支持版本 ${pkg.version}；当前已适配 ${VERSION}。未修改文件。`);
+  check(SUPPORTED_VERSIONS.includes(pkg.version), `暂不支持版本 ${pkg.version}；当前已适配 ${SUPPORTED_VERSIONS.join(' / ')}。未修改文件。`);
   const main = only([...a.entries.keys()].filter(n => /^\.vite\/build\/main-[^/]+\.js$/.test(n)), '主模块');
   const checkout = !needCheckout ? null : only([...a.entries.keys()].filter(n => /^webview\/assets\/webview-page-[^/]+\.js$/.test(n) &&
     a.entry(n).bytes.includes(Buffer.from('CheckoutPricingWebviewHost'))), '购买模块');
@@ -214,10 +217,11 @@ function verifyLegacy(main, checkout) {
   });
   for (const [name, found] of Object.entries(matches)) only(found, `旧补丁 ${name}`);
 }
-function buildArchive(original, runtime, selected, revision = 9, inactiveMinutes = 5) {
+function buildArchive(original, runtime, selected, revision = 10, inactiveMinutes = 5) {
   inactiveMinutes = normalizeInactiveMinutes(inactiveMinutes);
   const options = normalizeOptions(selected), enabled = runtime ? selectedEdits(options) : ['avatar', 'hotkey', 'detached', 'menu', 'checkout-pricing', 'checkout-credit'];
   const { a, pkg, main, checkout } = modules(original, enabled.some(id => id.startsWith('checkout-')));
+  if (pkg.version !== VERSION && options.some(id => !['avatar','hotkey','detached','menu','checkout-pricing','checkout-credit','image-data-url-first','cached-scroll-cleanup','clipboard-compat'].includes(id))) throw Error('该应用版本目前仅适配基础六项、图片内存优先、滚动清理及剪贴板启动选项；请取消其他选项。');
   const mainSource = a.entry(main).bytes.toString();
   const legacy = runtime && mainSource.includes(MARKER);
   const replacements = new Map(), changes = [];
@@ -243,6 +247,17 @@ function buildArchive(original, runtime, selected, revision = 9, inactiveMinutes
     }
     if (revision >= 9 && options.includes('reduced-motion'))
       put(main, transformReducedMotion((replacements.get(main) ?? a.entry(main).bytes).toString()));
+    if (revision >= 10 && options.includes('image-data-url-first')) {
+      const patterns = pkg.version === VERSION ? [/^\.vite\/build\/bootstrap-[^/]+\.js$/, /^webview\/assets\/app-shared-[^/]+\.js$/] : [/^\.vite\/build\/src-[^/]+\.js$/, /^webview\/assets\/app-initial-[^/]+\.js$/];
+      for (const [index, pattern] of patterns.entries()) {
+        const name = only([...a.entries.keys()].filter(n => pattern.test(n) && a.entry(n).bytes.includes(Buffer.from('type:`localImage`'))), '图片转换模块');
+        put(name, transformImageInput((replacements.get(name) ?? a.entry(name).bytes).toString(), index ? 'renderer' : 'main'));
+      }
+    }
+    if (revision >= 10 && options.includes('cached-scroll-cleanup')) {
+      const name = only([...a.entries.keys()].filter(n => /^webview\/assets\/local-conversation-thread-[^/]+\.js$/.test(n) && a.entry(n).bytes.includes(Buffer.from('setFooterResizeViewportPreserveDisabled'))), '会话滚动模块');
+      put(name, transformScrollCleanup(a.entry(name).bytes.toString()));
+    }
     const groups = { main: ['batched-pty-output'], initial: ['settled-stream-text', 'coalesced-mcp-inventory'], shared: ['command-output-items', 'cached-highlight-language', 'highlight-timer-cleanup'] };
     for (const [kind, ids] of Object.entries(groups)) {
       if (!ids.some(id => enabled.includes(id))) continue;
@@ -273,8 +288,8 @@ function buildArchive(original, runtime, selected, revision = 9, inactiveMinutes
 }
 // 原位安装/恢复保留旧算法，确保已安装 v0.3 的配套哈希仍可验证。
 export function buildPatch(original) { return buildArchive(original, false); }
-export function buildOptimizedPatch(original, selected, revision = 9, inactiveMinutes = 5) { return buildArchive(original, true, selected, revision, inactiveMinutes); }
-export function buildOptimizedInstallation(original, originalExe, selected, revision = 9, inactiveMinutes = 5) {
+export function buildOptimizedPatch(original, selected, revision = 10, inactiveMinutes = 5) { return buildArchive(original, true, selected, revision, inactiveMinutes); }
+export function buildOptimizedInstallation(original, originalExe, selected, revision = 10, inactiveMinutes = 5) {
   const candidate = buildOptimizedPatch(original, selected, revision, inactiveMinutes), executable = updateExecutable(originalExe, original, candidate.bytes);
   return { asar: candidate.bytes, exe: executable.bytes, report: { ...candidate.report,
     sourceExeSha256: sha256(originalExe), candidateExeSha256: sha256(executable.bytes),
@@ -344,13 +359,14 @@ export function resolveUpgrade(target, selected, forRestore = false, inactiveMin
   const selectionText = fs.existsSync(selectionFile) ? fs.readFileSync(selectionFile, 'utf8') : null;
   const saved = selectionText === null ? null : JSON.parse(selectionText);
   if (saved) check(saved.format === 1 && Array.isArray(saved.options) && JSON.stringify(saved.beforeHashes) === JSON.stringify(beforeHashes), '优化选项记录与配套备份不匹配，请核对 codex-lite-install.json。');
-  let installedOptions = normalizeOptions(saved?.options ?? UNRECORDED_OPTIONS);
+  const originalVersion = JSON.parse(readArchive(original).entry('package.json').bytes).version;
+  let installedOptions = normalizeOptions(saved?.options ?? (originalVersion === VERSION ? UNRECORDED_OPTIONS : beforeState === 'patched' ? DEFAULT_OPTIONS : []));
   let installedInactiveMinutes = normalizeInactiveMinutes(saved?.inactiveMinutes ?? 5);
   const previousInactiveMinutes = normalizeInactiveMinutes(saved?.previousInactiveMinutes ?? 5);
   const options = forRestore ? installedOptions : normalizeOptions(selected);
-  const candidate = buildOptimizedInstallation(original, originalExe, options, 9, forRestore ? installedInactiveMinutes : inactiveMinutes);
+  const candidate = buildOptimizedInstallation(original, originalExe, options, 10, forRestore ? installedInactiveMinutes : inactiveMinutes);
   let installedRevision = saved?.revision ?? 5;
-  check([5, 6, 7, 8, 9].includes(installedRevision) && (saved?.previousRevision === undefined || [5, 6, 7, 8, 9].includes(saved.previousRevision)), '不支持的补丁算法版本。');
+  check([5, 6, 7, 8, 9, 10].includes(installedRevision) && (saved?.previousRevision === undefined || [5, 6, 7, 8, 9, 10].includes(saved.previousRevision)), '不支持的补丁算法版本。');
   // 旧记录没有算法版本，按 v0.8.0 重建校验；选项相同也不能误用新版哈希。
   const installed = atBaseline || installedRevision === candidate.report.patchVersion && JSON.stringify(options) === JSON.stringify(installedOptions) && installedInactiveMinutes === candidate.report.inactiveMinutes
     ? candidate : buildOptimizedInstallation(original, originalExe, installedOptions, installedRevision, installedInactiveMinutes);
@@ -373,9 +389,12 @@ export function resolveUpgrade(target, selected, forRestore = false, inactiveMin
   const state = atBaseline ? beforeState : atPrevious || currentHashes.every((hash, i) => hash === installedHashes[i]) ? 'upgraded' : 'partial';
   const backupsComplete = fs.existsSync(backup) && fs.existsSync(exeBackup);
   check(state !== 'partial' || backupsComplete, '安装处于半完成状态且缺少配套回滚备份。');
+  const launch = readLaunchConfig(path.dirname(exe));
+  const launchMatches = JSON.stringify(launch?.launchArguments ?? []) === JSON.stringify(options.includes('clipboard-compat') ? ['--disable-features=NonBlockingOsClipboardReads'] : []) &&
+    (!launch || launch.candidateAsarSha256 === afterHashes[0] && launch.candidateExeSha256 === afterHashes[1] && LAUNCH_FILES.every(n => fs.existsSync(path.join(path.dirname(exe), n))));
   return { target, exe, backup, exeBackup, candidate, asarInput, exeInput, beforeAsar, beforeExe,
     beforeHashes, currentHashes, afterHashes, state, beforeState, backupsComplete, installedOptions, installedRevision, installedInactiveMinutes,
-    selectionFile, selectionText, matchesSelection: currentHashes.every((hash, i) => hash === afterHashes[i]) };
+    selectionFile, selectionText, binaryMatches: currentHashes.every((hash, i) => hash === afterHashes[i]), matchesSelection: currentHashes.every((hash, i) => hash === afterHashes[i]) && launchMatches };
 }
 export function sourceForCopy(target, selected, inactiveMinutes) {
   const result = resolveUpgrade(target, selected, false, inactiveMinutes);

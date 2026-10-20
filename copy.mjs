@@ -2,7 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { sourceForCopy, VERSION, SELECTION_FILE } from './patch.mjs';
+import { sourceForCopy, SELECTION_FILE } from './patch.mjs';
+import { launchArguments, LAUNCH_METADATA, readLaunchConfig } from './launch-config.mjs';
 import { parsePatchArguments } from './options.mjs';
 
 const TOOL_ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -38,10 +39,11 @@ function sourceRoot(target) {
   return { root, target: real };
 }
 function inventory(root) {
-  const result = [];
+  const result = [], ownLaunch = readLaunchConfig(root);
   function visit(directory, prefix = '') {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       const relative = prefix + entry.name, full = path.join(directory, entry.name);
+      if (ownLaunch && [LAUNCH_METADATA, ...LAUNCH_FILES].includes(relative)) continue;
       if ([SELECTION_FILE, SELECTION_FILE + '.tmp'].includes(relative)) continue;
       // 不把旧补丁回滚材料复制到优化版中。
       if (/^(ChatGPT\.exe|resources\/app\.asar)\.(before-perf-v\d+|perf-v\d+\.tmp|before-lite-v\d+|lite-v\d+\.tmp)$/.test(relative)) continue;
@@ -63,7 +65,7 @@ function prepare(target, selected, inactiveMinutes) {
   return { ...source, ...prepared, files };
 }
 function report(source) {
-  return { version: VERSION, sourceRoot: source.root, sourceState: source.state,
+  return { launchArguments: launchArguments(source.candidate.report.selectedOptions), version: source.candidate.report.version, sourceRoot: source.root, sourceState: source.state,
     useVerifiedBackups: source.asarInput !== source.target, fileCount: source.files.length,
     estimatedBytes: source.files.reduce((sum, f) => sum + f.size, 0), ...source.candidate.report, status: 'copy-ready' };
 }
@@ -103,10 +105,10 @@ export function createCopy(target, destination, selected, inactiveMinutes) {
     fs.copyFileSync(from, to, fs.constants.COPYFILE_EXCL);
     records.push({ path: name, size: fs.statSync(to).size, sha256: hashFile(to) });
   }
-  const manifest = { format: 1, toolVersion: '0.11.0', appVersion: VERSION, createdAt: new Date().toISOString(), selectedOptions: source.candidate.report.selectedOptions, inactiveMinutes: source.candidate.report.inactiveMinutes,
+  const manifest = { format: 1, toolVersion: '0.12.0', appVersion: source.candidate.report.version, createdAt: new Date().toISOString(), selectedOptions: source.candidate.report.selectedOptions, inactiveMinutes: source.candidate.report.inactiveMinutes,
     sourceRoot: source.root, sourceState: source.state, sourceAsarSha256: source.candidate.report.sourceSha256,
     sourceExeSha256: source.candidate.report.sourceExeSha256, candidateAsarSha256: source.candidate.report.candidateSha256,
-    candidateExeSha256: source.candidate.report.candidateExeSha256, launchArguments: ['--disable-features=NonBlockingOsClipboardReads'],
+    candidateExeSha256: source.candidate.report.candidateExeSha256, launchArguments: launchArguments(source.candidate.report.selectedOptions),
     files: records.map(({ inputHash, ...record }) => record) };
   fs.writeFileSync(path.join(stage, MANIFEST), JSON.stringify(manifest, null, 2) + '\n', { flag: 'wx' });
   check(!fs.existsSync(output), '目标目录已被其他操作创建，请保留 .building 现场并选择新目录。');

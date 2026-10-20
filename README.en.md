@@ -4,7 +4,7 @@
 
 Optional performance patches for the Windows Codex desktop app. Reduce hidden-window preloading, batch frequent output and refresh events, and avoid unnecessary background work.
 
-- **Choose your optimizations**: 16 options. Only the six v0.3.0 baseline options are enabled by default; the later eight runtime options and two new experiments require explicit selection.
+- **Choose your optimizations**: 19 options. Only the six v0.3.0 baseline options are enabled by default; the remaining 13 require explicit selection and version support.
 - **Two deployment modes**: patch an existing installation in place or create a separate optimized copy.
 - **Rollback support**: in-place upgrades retain paired backups and a record of selected options.
 - **Source only**: run locally with Node.js and PowerShell; no npm dependency installation required.
@@ -19,10 +19,10 @@ This is an unofficial project with no affiliation with or endorsement from OpenA
 |---|---|
 | OS | Windows, with read/write access to the target directory |
 | Runtime | Windows PowerShell 5.1 and Node.js 20+ |
-| Codex | A complete desktop installation; currently supports **`26.928.20755`** only |
+| Codex | A complete desktop installation; currently supports **`26.928.20755` and `26.1013.40934`** |
 | Resources | Several GB of available memory during generation; disk requirements depend on the mode below |
 
-The supported app version is defined by `VERSION` in [patch.mjs](patch.mjs). Unknown versions are rejected. Deselecting optimizations does not bypass the version check.
+The supported app version is defined by `SUPPORTED_VERSIONS` in [patch.mjs](patch.mjs). Unknown versions are rejected. Deselecting optimizations does not bypass the version check.
 
 ### Launch the tool
 
@@ -72,7 +72,7 @@ Once generation finishes, exit other Codex desktop processes and double-click `�
 
 ## Available optimizations
 
-Only the first six options in the table are enabled by default. The later eight runtime options remain available but start unchecked, as do the new Git scheduling and reduced-motion options. Both modes use the same patch logic. Deselected options skip their code transformations and corresponding match checks.
+Only the first six options in the table are enabled by default. All other options start unchecked. On 1013, only the baseline six and the image, scroll-cleanup, and clipboard options are supported; selecting other runtime options is rejected. Both modes use the same patch logic. Deselected options skip their code transformations and corresponding match checks.
 
 | Optimization | Behavior and trade-off |
 |---|---|
@@ -92,6 +92,9 @@ Only the first six options in the table are enabled by default. The later eight 
 | Share the app-tools channel | Local Windows `codex_app` connections use the existing desktop main process, removing per-session Node/CMD adapters while retaining the original handlers and approval configuration |
 | Serialize Git snapshots per repository | Serializes turn-diff temporary-index snapshots for each repository, shares concurrent requests for the same generation, and rejects stale queued work before starting; completed results are not cached |
 | Reduce interface motion (experimental) | Sets Chromium’s reduced-motion preference in the main process so existing renderer paths can use simpler effects; visual motion may decrease, and CPU savings have not been measured |
+| Prefer in-memory image data | Sends available image data URLs before local paths; intended for transparent-encryption compatibility, with no paste-speed guarantee |
+| Use cached scroll distance during cleanup | Avoids one geometry read during conversation-page cleanup; preserves other scrolling paths, with desktop position-restoration testing still required |
+| Clipboard compatibility launcher | Adds `--disable-features=NonBlockingOsClipboardReads` only through the generated entry; off by default, without changing system settings or existing shortcuts |
 
 With the inactive-session option selected, switching away makes the hidden page releases its active-session lease while its content can remain cached. Returning reacquires the lease. The inactivity timer no longer waits for the roughly 10-minute page cache to expire first.
 
@@ -112,6 +115,14 @@ Reduced motion uses a main-process startup switch to affect renderer paths that 
 See [options.json](options.json) for option IDs. Selecting none adds no optimizations: in-place mode leaves a clean installation unchanged and creates no backups; copy mode still copies the runtime files.
 
 Use an unmodified source installation for full control over every option. Previously patched installations are accepted only when their state can be verified. An existing optimization that cannot be reversed cannot be removed by deselecting it.
+
+## Clipboard entry and standalone repairs
+
+Enabling clipboard compatibility in-place creates a lightweight `启动优化版.cmd`, `start-optimized.ps1`, and `codex-lite-launch.json` in the app directory. Only this entry supplies the switch. Changing only launch options does not rewrite already-matching EXE/ASAR files or create large backups. Copy mode stores optional arguments in its manifest instead of enabling the switch unconditionally. Deselecting the option or rolling back clears the arguments and refreshes core hashes while retaining the entry files. Existing shortcuts remain unchanged.
+
+Image and scroll repairs reuse the single application baseline backup. Deselecting an option cannot reverse changes already present in that baseline.
+
+The CUA cursor and FrameArrived repairs are separate **1013-only experimental patches** for an explicitly selected legacy x64 helper. They reject 928 and Swift helpers and do not switch the active backend. Historical image repair is a separate script operating on one explicitly named image in one session. See the [standalone instructions](standalone/README.md) for requirements, ordering, rollback and validation limits.
 
 ## Performance observations
 
@@ -181,7 +192,7 @@ $env:CODEX_TEST_ASAR = 'C:\Apps\Codex\app\resources\app.asar'
 npm test
 ```
 
-Option names and dependencies are maintained in [options.json](options.json). Core transformations live in [patch.mjs](patch.mjs), [runtime-patches.mjs](runtime-patches.mjs), and [performance-patches.mjs](performance-patches.mjs). See [VALIDATION.md](VALIDATION.md) (Chinese) for completed checks and remaining coverage gaps. Syntax, structural, and startup checks do not replace full desktop feature acceptance testing.
+Option names and dependencies are maintained in [options.json](options.json). Core transformations live in [patch.mjs](patch.mjs), [runtime-patches.mjs](runtime-patches.mjs), and [performance-patches.mjs](performance-patches.mjs), and [compatibility-patches.mjs](compatibility-patches.mjs). See [VALIDATION.md](VALIDATION.md) (Chinese) for completed checks and remaining coverage gaps. Syntax, structural, and startup checks do not replace full desktop feature acceptance testing.
 
 ## Credits and license
 

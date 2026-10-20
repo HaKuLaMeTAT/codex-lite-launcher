@@ -8,3 +8,9 @@ node_modules/
 *.exe
 *.dll
 *.node
+
+__pycache__/
+*.pyc
+*.exe.lite-*.stage
+*.exe.lite-*.json
+*.exe.before-lite-*

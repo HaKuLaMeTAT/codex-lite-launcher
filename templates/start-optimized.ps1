@@ -8,14 +8,15 @@ function Get-CoreHash([string]$Path) {
     finally { $stream.Dispose(); $algorithm.Dispose() }
 }
 try {
-    $manifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'codex-optimized-copy.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($manifest.format -ne 1) { throw '副本清单格式不支持，请重新生成。' }
+    $manifestName = if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'codex-optimized-copy.json')) { 'codex-optimized-copy.json' } else { 'codex-lite-launch.json' }
+    $manifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot $manifestName) -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($manifest.format -ne 1) { throw '启动清单格式不支持，请重新生成入口。' }
     $exe = Join-Path $PSScriptRoot 'ChatGPT.exe'
     $asar = Join-Path $PSScriptRoot 'resources\app.asar'
     # 每次启动先确认核心文件仍配套；更新或手动覆盖后不能误用原来的补丁状态。
     if ((Get-CoreHash $exe) -ne $manifest.candidateExeSha256 -or
         (Get-CoreHash $asar) -ne $manifest.candidateAsarSha256) {
-        throw '副本核心文件已变化。请从原安装重新生成，不要混用不同版本的 EXE 和 ASAR。'
+        throw '核心文件已变化。请重新检查补丁并生成入口，不要混用不同版本的 EXE 和 ASAR。'
     }
     if ($CheckOnly) { Write-Output 'COPY_CORE_VERIFIED'; exit 0 }
     if (Get-Process -Name ChatGPT -ErrorAction SilentlyContinue) { throw '已有 Codex 正在运行。请先退出原版或其他副本，再启动优化版。' }
@@ -24,11 +25,13 @@ try {
     $info.FileName = $exe
     $info.WorkingDirectory = $PSScriptRoot
     $info.UseShellExecute = $false
-    $info.Arguments = '--disable-features=NonBlockingOsClipboardReads'
+    $arguments = @($manifest.launchArguments)
+    if (@($arguments | Where-Object { $_ -ne '--disable-features=NonBlockingOsClipboardReads' }).Count) { throw '启动参数不受支持，请重新生成入口。' }
+    $info.Arguments = $arguments -join ' '
     [void][Diagnostics.Process]::Start($info)
 } catch {
     if ($CheckOnly) { Write-Error $_.Exception.Message; exit 1 }
     Add-Type -AssemblyName System.Windows.Forms
-    [void][Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Codex 优化副本', 'OK', 'Warning')
+    [void][Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Codex 优化启动', 'OK', 'Warning')
     exit 1
 }

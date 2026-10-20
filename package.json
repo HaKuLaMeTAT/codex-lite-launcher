@@ -1,6 +1,6 @@
 {
   "name": "codex-lite-launcher",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "private": true,
   "type": "module",
   "description": "Source-only Windows Codex performance patch with in-place upgrades and independent optimized copies",

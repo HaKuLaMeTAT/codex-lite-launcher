@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveUpgrade, requireStopped, sha256 } from './patch.mjs';
+import { checkLaunchFiles, writeLaunchConfig, readLaunchConfig, LAUNCH_FILES } from './launch-config.mjs';
 import { parsePatchArguments } from './options.mjs';
 
 const TEMP_SUFFIX = '.lite-v5.tmp';
@@ -17,10 +18,11 @@ function report(plan, status = 'upgrade-ready') {
   const backupBytes = items.reduce((sum, item) => sum + (fs.existsSync(item.backup) ? 0 : item.before.length), 0);
   const stageBytes = items.reduce((sum, item) => sum + Math.max(item.before.length, item.after.length), 0);
   const disk = fs.statfsSync(path.dirname(plan.target));
-  return { ...plan.candidate.report, status, state: plan.state, beforeState: plan.beforeState,
-    backup: plan.backup, exeBackup: plan.exeBackup, canRestore: plan.backupsComplete,
+  const root = path.dirname(plan.exe), launch = readLaunchConfig(root);
+  return { ...plan.candidate.report, status, launcher: launch ? path.join(root, LAUNCH_FILES[0]) : null, launchArguments: launch?.launchArguments ?? [], state: plan.state, beforeState: plan.beforeState,
+    backup: plan.backup, exeBackup: plan.exeBackup, canRestore: plan.backupsComplete || !!launch,
     installedOptions: plan.installedOptions, installedInactiveMinutes: plan.installedInactiveMinutes, matchesSelection: plan.matchesSelection,
-    requiredFreeBytes: backupBytes + stageBytes, backupBytes: items.reduce((sum, item) => sum + item.before.length, 0),
+    requiredFreeBytes: plan.binaryMatches ? 0 : backupBytes + stageBytes, backupBytes: items.reduce((sum, item) => sum + item.before.length, 0),
     freeBytes: disk.bavail * disk.bsize };
 }
 export function inspectUpgrade(target, selected, inactiveMinutes) { return report(resolveUpgrade(target, selected, false, inactiveMinutes)); }
@@ -57,6 +59,17 @@ export function applyUpgrade(target, requireIdle = requireStopped, selected, ina
   requireIdle();
   const plan = resolveUpgrade(target, selected, false, inactiveMinutes), info = report(plan), items = files(plan);
   if (plan.state !== 'partial' && plan.matchesSelection) return report(plan, 'upgrade-applied');
+  checkLaunchFiles(path.dirname(plan.exe), plan.candidate.report.selectedOptions);
+  if (plan.binaryMatches) {
+    currentUnchanged(plan);
+    // 仅改变启动配置也记录所选组合；不伪造旧版全选状态，不复制大型备份。
+    const record = { format: 1, revision: plan.candidate.report.patchVersion, options: plan.candidate.report.selectedOptions,
+      inactiveMinutes: plan.candidate.report.inactiveMinutes, beforeHashes: plan.beforeHashes };
+    fs.writeFileSync(plan.selectionFile + '.tmp', JSON.stringify(record, null, 2) + '\n', { flag: 'wx' });
+    fs.renameSync(plan.selectionFile + '.tmp', plan.selectionFile);
+    writeLaunchConfig(path.dirname(plan.exe), plan.afterHashes, plan.candidate.report.selectedOptions);
+    return report({ ...plan, matchesSelection: true }, 'upgrade-applied');
+  }
   check(plan.state !== 'partial', '安装处于半完成状态，请先执行原位回滚。');
   check(info.freeBytes >= info.requiredFreeBytes, `磁盘空间不足，至少需要 ${(info.requiredFreeBytes / 1024 ** 3).toFixed(2)} GiB 可用空间。`);
   checkTemporary(items);
@@ -76,12 +89,19 @@ export function applyUpgrade(target, requireIdle = requireStopped, selected, ina
   fs.renameSync(plan.selectionFile + '.tmp', plan.selectionFile);
   plan.selectionText = selectionText;
   replace(items, 'after');
+  writeLaunchConfig(path.dirname(plan.exe), plan.afterHashes, plan.candidate.report.selectedOptions);
   // 上一组选项只是少量恢复元数据，下次升级直接覆盖，不累积文件或历史记录。
   return report({ ...plan, state: 'upgraded', backupsComplete: true, matchesSelection: true, installedOptions: plan.candidate.report.selectedOptions, installedInactiveMinutes: plan.candidate.report.inactiveMinutes }, 'upgrade-applied');
 }
 export function restoreUpgrade(target, requireIdle = requireStopped) {
   requireIdle();
   const plan = resolveUpgrade(target, undefined, true), items = files(plan);
+  const root = path.dirname(plan.exe);
+  checkLaunchFiles(root, []);
+  if (!plan.backupsComplete && plan.currentHashes.every((hash, i) => hash === plan.beforeHashes[i]) && readLaunchConfig(root)) {
+    writeLaunchConfig(root, plan.beforeHashes, []);
+    return report({ ...plan, state: plan.beforeState }, 'upgrade-restored');
+  }
   check(plan.backupsComplete, '没有完整的原位升级备份，不能回滚。');
   checkTemporary(items);
   const disk = fs.statfsSync(path.dirname(plan.target));
@@ -89,6 +109,7 @@ export function restoreUpgrade(target, requireIdle = requireStopped) {
   stage(items, 'before');
   requireIdle(); currentUnchanged(plan);
   replace(items, 'before');
+  writeLaunchConfig(root, plan.beforeHashes, []);
   return report({ ...plan, state: plan.beforeState }, 'upgrade-restored');
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

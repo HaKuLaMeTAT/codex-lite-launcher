@@ -13,6 +13,9 @@ import { createCopy, inspectSource, verifyCopy, hashFile, MANIFEST } from '../co
 import { OPTIONS, DEFAULT_OPTIONS, ALL_OPTIONS, normalizeOptions, parseOptionsArgument, parsePatchArguments } from '../options.mjs';
 import { SELECTION_FILE, UNRECORDED_OPTIONS } from '../patch.mjs';
 import acorn from '../vendor/acorn.cjs';
+import { transformImageInput, transformScrollCleanup } from '../compatibility-patches.mjs';
+import { prepareHistory, applyHistory } from '../standalone/history-image.mjs';
+import { readLaunchConfig, LAUNCH_METADATA } from '../launch-config.mjs';
 import { createSnapshotScheduler, transformGitSnapshotScheduling, transformReducedMotion } from '../performance-patches.mjs';
 import { execFileSync } from 'node:child_process';
 import http from 'node:http';
@@ -166,18 +169,23 @@ const pageLease = `function page({view,active}) {
 }`;
 
 const gitWorker = 'function capture(repo){let snapshot=repo.reviewSnapshot;return repo.queryClient.fetchQuery({queryKey:key(repo.root,repo.host,`turn-diff-snapshot-tree`,`${snapshot.generation}`),gcTime:250,queryFn:()=>snapshot.read(()=>makeTree(repo,snapshot.signal)),staleTime:0})}';
-const OLD_OPTIONS = ALL_OPTIONS.filter(id => !['serialized-git-snapshots', 'reduced-motion'].includes(id));
+const OLD_OPTIONS = ALL_OPTIONS.filter(id => !['serialized-git-snapshots', 'reduced-motion', 'image-data-url-first', 'cached-scroll-cleanup', 'clipboard-compat'].includes(id));
+
+const imageInput = 'function imageInput(e,{localPath:t,isRemoteHost:n=!1}={}){let r=/^data:image\\//i.test(e);if(!n&&t)return{type:`localImage`,path:t};if(r)return{type:`image`,url:e};return{type:`localImage`,path:e}}';
+const scrollCleanup = 'function cleanup(){controller.setFooterResizeViewportPreserveDisabled(!1);let i=controller.getScrollElement(),a=i==null?controller.getLastScrollDistanceFromBottomPx():geometry(i);return save({distanceFromBottomPx:a,scrollState:state})}';
 
 function fixture(version = VERSION) {
   const files = new Map([
     ['package.json', JSON.stringify({ name: 'openai-codex-electron', version })],
     ['.vite/build/main-renamed.js', 'const electron = require("electron");\n' + main + appToolsFactory + sharedAppTools], ['webview/assets/webview-page-renamed.js', checkout],
-    ['webview/assets/app-initial-renamed.js', initial], ['webview/assets/app-shared-renamed.js', shared + lifecycle],
-    ['.vite/build/bootstrap-renamed.js', lifecycle],
+    ['webview/assets/app-initial-renamed.js', initial + (version === '26.1013.40934' ? imageInput : '')], ['webview/assets/app-shared-renamed.js', shared + lifecycle + imageInput],
+    ['.vite/build/bootstrap-renamed.js', lifecycle + imageInput],
     ['.vite/build/worker.js', gitWorker],
+    ['webview/assets/local-conversation-thread-renamed.js', scrollCleanup],
     ['webview/assets/app-primary-renamed.js', pageLease],
     ['unrelated.txt', 'preserve custom screenshot patch and settings'],
   ]);
+  if (version === '26.1013.40934') files.set('.vite/build/src-renamed.js', imageInput);
   const header = { files: {} }, data = [];
   let offset = 0;
   for (const [name, source] of files) {
@@ -310,7 +318,7 @@ test('independent copy uses original or verified backups, preserves source and r
     assert.equal(fs.existsSync(path.join(patchedOutput, 'resources', 'app.asar' + BACKUP_SUFFIX)), false);
     const manifest = JSON.parse(fs.readFileSync(path.join(patchedOutput, MANIFEST)));
     assert.equal(manifest.sourceState, 'patched');
-    assert.deepEqual(manifest.launchArguments, ['--disable-features=NonBlockingOsClipboardReads']);
+    assert.deepEqual(manifest.launchArguments, []);
     assert.ok(manifest.files.some(item => item.path === 'resources/app.asar.unpacked/native.node'));
     fs.appendFileSync(path.join(patchedOutput, 'chrome.dll'), 'changed');
     assert.throws(() => verifyCopy(patchedOutput), /已变化/);
@@ -323,15 +331,33 @@ test('independent copy uses original or verified backups, preserves source and r
   }
 });
 
-test('real ASAR: seven modules, lifecycle scheduling, packed files and external metadata verify', {
+test('real 1013 ASAR: baseline plus image/scroll/clipboard retain packed data and paired integrity', {
+  skip: !process.env.CODEX_TEST_ASAR_1013,
+}, () => {
+  const selected = [...DEFAULT_OPTIONS, 'image-data-url-first', 'cached-scroll-cleanup', 'clipboard-compat'];
+  const source = sourceForCopy(process.env.CODEX_TEST_ASAR_1013, selected);
+  const original = fs.readFileSync(source.asarInput), candidate = source.candidate;
+  assert.equal(candidate.report.version, '26.1013.40934');
+  assert.equal(candidate.report.patchVersion, 10);
+  assert.equal(candidate.report.modules.length, 5); assert.equal(candidate.report.changes.length, 9);
+  verifyContents(original, candidate.asar, candidate.report.modules);
+  assert.equal(executableIntegrity(candidate.exe).hash, headerHash(candidate.asar));
+  const archive = readArchive(candidate.asar);
+  for (const name of candidate.report.modules.filter(n => /src-|app-initial-/.test(n))) {
+    const source = archive.entry(name).bytes.toString();
+    assert.ok(source.includes('if(r)return{type:`image`,url:e};if(!n&&t)return{type:`localImage`,path:t};'));
+  }
+});
+
+test('real ASAR: eight modules, lifecycle scheduling, packed files and external metadata verify', {
   skip: !process.env.CODEX_TEST_ASAR,
 }, () => {
   const minutes = Number(process.env.CODEX_TEST_INACTIVE_MINUTES ?? 5);
   const source = sourceForCopy(process.env.CODEX_TEST_ASAR, ALL_OPTIONS, minutes);
   const original = fs.readFileSync(source.asarInput), result = { bytes: source.candidate.asar, report: source.candidate.report };
-  assert.equal(result.report.patchVersion, 9);
-  assert.equal(result.report.modules.length, 7);
-  assert.equal(result.report.changes.length, 19);
+  assert.equal(result.report.patchVersion, 10);
+  assert.equal(result.report.modules.length, 8);
+  assert.equal(result.report.changes.length, 22);
   verifyContents(original, result.bytes, result.report.modules);
   const originalExe = fs.readFileSync(source.exeInput);
   const resource = executableIntegrity(originalExe), patchedExe = updateExecutable(originalExe, original, result.bytes).bytes;
@@ -602,6 +628,85 @@ test('reduced motion is opt-in and sets the native preference before main startu
   assert.throws(() => transformReducedMotion(source + 'require("electron");'), /唯一匹配/);
 });
 
+test('1013 baseline and compatibility options preserve defaults, image fallbacks and cleanup behavior', () => {
+  const original = fixture('26.1013.40934');
+  assert.equal(buildOptimizedPatch(original).report.version, '26.1013.40934');
+  assert.deepEqual(buildOptimizedPatch(original).report.selectedOptions, DEFAULT_OPTIONS);
+  const selected = [...DEFAULT_OPTIONS, 'image-data-url-first', 'cached-scroll-cleanup', 'clipboard-compat'];
+  const result = buildOptimizedPatch(original, selected);
+  assert.equal(result.report.changes.length, 9); verifyContents(original, result.bytes, result.report.modules);
+  assert.throws(() => buildOptimizedPatch(original, ['batched-pty-output']), /目前仅适配/);
+  const patched = transformImageInput(imageInput, 'main').bytes.toString();
+  const convert = vm.runInNewContext(patched + ';imageInput');
+  assert.equal(convert('data:image/png;base64,AA==', { localPath: 'encrypted.png' }).type, 'image');
+  assert.equal(convert('data:image/png;base64,AA==', { localPath: 'encrypted.png', isRemoteHost: true }).type, 'image');
+  assert.equal(convert('plain', { localPath: 'only-path.png' }).path, 'only-path.png');
+  assert.equal(convert('plain', { localPath: 'only-path.png', isRemoteHost: true }).path, 'plain');
+  assert.equal(transformImageInput(patched, 'main').bytes.toString(), patched);
+  let geometryReads = 0;
+  const cleanup = vm.runInNewContext(transformScrollCleanup(scrollCleanup).bytes.toString() + ';cleanup', {
+    controller: { setFooterResizeViewportPreserveDisabled() {}, getScrollElement: () => ({}), getLastScrollDistanceFromBottomPx: () => 42 },
+    geometry: () => { geometryReads++; return 42; }, state: {}, save: x => x,
+  });
+  assert.equal(cleanup().distanceFromBottomPx, 42); assert.equal(geometryReads, 0);
+  assert.throws(() => transformImageInput('function unrelated(){}', 'main'), /唯一匹配/);
+  assert.throws(() => transformScrollCleanup('function unrelated(){}'), /唯一匹配/);
+});
+
+test('clipboard option creates a verified lightweight launcher without rewriting matching app files', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-perf-test-'));
+  try {
+    const root = path.join(directory, 'app'); fs.mkdirSync(root);
+    const target = path.join(root, 'resources', 'app.asar'), exe = path.join(root, 'ChatGPT.exe');
+    fs.mkdirSync(path.dirname(target)); const original = fixture('26.1013.40934');
+    fs.writeFileSync(target, original); fs.writeFileSync(exe, exeFixture(original));
+    const before = [target, exe].map(hashFile), selected = ['clipboard-compat'];
+    assert.equal(inspectUpgrade(target, selected).matchesSelection, false);
+    const info = applyUpgrade(target, () => {}, selected);
+    assert.equal(info.requiredFreeBytes, 0);
+    assert.ok(fs.existsSync(info.launcher)); assert.equal(inspectUpgrade(target, selected).matchesSelection, true);
+    assert.deepEqual([target, exe].map(hashFile), before);
+    assert.equal(fs.existsSync(target + UPGRADE_BACKUP_SUFFIX), false);
+    assert.deepEqual(readLaunchConfig(root).launchArguments, ['--disable-features=NonBlockingOsClipboardReads']);
+    restoreUpgrade(target, () => {}); assert.deepEqual(readLaunchConfig(root).launchArguments, []);
+    applyUpgrade(target, () => {}, selected);
+    applyUpgrade(target, () => {}, []); assert.deepEqual(readLaunchConfig(root).launchArguments, []);
+    fs.mkdirSync(path.join(root, 'resources', 'app.asar.unpacked'));
+    fs.mkdirSync(path.join(root, 'locales')); fs.writeFileSync(path.join(root, 'chrome.dll'), 'fixture');
+    const output = path.join(directory, 'copy'); createCopy(target, output, selected);
+    const manifest = JSON.parse(fs.readFileSync(path.join(output, MANIFEST)));
+    assert.equal(manifest.appVersion, '26.1013.40934');
+    assert.deepEqual(manifest.launchArguments, ['--disable-features=NonBlockingOsClipboardReads']);
+    assert.ok(execFileSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(output, 'start-optimized.ps1'), '-CheckOnly'], {encoding:'utf8', windowsHide:true}).includes('COPY_CORE_VERIFIED'));
+    fs.appendFileSync(path.join(root, 'start-optimized.ps1'), '# user change');
+    assert.throws(() => applyUpgrade(target, () => {}, selected), /拒绝覆盖/);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, LAUNCH_METADATA))).launchArguments.length, 0);
+  } finally {
+    assert.ok(path.relative(fs.realpathSync(os.tmpdir()), fs.realpathSync(directory)).startsWith('codex-perf-test-'));
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('history image repair changes one item, preserves other bytes and rejects ambiguous or changed sessions', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-perf-test-'));
+  try {
+    const source = path.join(directory, 'rollout.jsonl'), stage = path.join(directory, 'candidate.jsonl');
+    const url = 'data:image/png;base64,' + Buffer.from('89504e470d0a1a0a', 'hex').toString('base64');
+    const data = JSON.stringify({ type: 'response_item', payload: { role: 'user', content: [{ type: 'input_text', text: 'shot.png' }, { type: 'input_image', image_url: url }] } }) + '\r\n' +
+      JSON.stringify({ type: 'item_completed', payload: { item: { type: 'UserMessage', content: [{ type: 'local_image', path: 'C:\\Temp\\shot.png' }] } } }) + '\r\n' + '{"unchanged": true}\n';
+    fs.writeFileSync(source, data); prepareHistory(source, 'shot.png', stage);
+    assert.ok(fs.readFileSync(stage, 'utf8').endsWith('{"unchanged": true}\n'));
+    applyHistory(source, stage, false, () => {}); assert.ok(fs.readFileSync(source, 'utf8').includes('"image_url"'));
+    applyHistory(source, stage, true, () => {}); assert.equal(fs.readFileSync(source, 'utf8'), data);
+    fs.appendFileSync(source, '{}\n'); assert.throws(() => applyHistory(source, stage, false, () => {}), /其他修改/);
+    fs.writeFileSync(source, data.replace('shot.png', 'different.png'));
+    assert.throws(() => prepareHistory(source, 'shot.png', path.join(directory, 'ambiguous.jsonl')), /未找到/);
+  } finally {
+    assert.ok(path.relative(fs.realpathSync(os.tmpdir()), fs.realpathSync(directory)).startsWith('codex-perf-test-'));
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('selected installation records survive restart, partial replacement and option-independent rollback', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-perf-test-'));
   const root = path.join(directory, 'source'), target = path.join(root, 'resources', 'app.asar'), exe = path.join(root, 'ChatGPT.exe');
@@ -766,7 +871,7 @@ test('runtime transforms reject incomplete, duplicate and already patched module
     assert.throws(() => transformRuntime(source + '\n{' + source + '\n}', kind), /唯一匹配/);
   }
   const original = fixture(), result = buildOptimizedPatch(original, ALL_OPTIONS);
-  assert.equal(result.report.modules.length, 7); assert.equal(result.report.changes.length, 19);
+  assert.equal(result.report.modules.length, 8); assert.equal(result.report.changes.length, 22);
   verifyContents(original, result.bytes, result.report.modules);
 });
 

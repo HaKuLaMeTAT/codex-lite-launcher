@@ -31,8 +31,8 @@ function Find-Installation {
 }
 
 $form = New-Object Windows.Forms.Form
-$form.Text = 'Codex 轻启 v0.11.0'
-$form.ClientSize = New-Object Drawing.Size(720, 750)
+$form.Text = 'Codex 轻启 v0.12.0'
+$form.ClientSize = New-Object Drawing.Size(720, 800)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
@@ -92,7 +92,7 @@ $optionList.CheckOnClick = $true
 $optionList.MultiColumn = $true
 $optionList.ColumnWidth = 332
 $optionList.IntegralHeight = $false
-$optionList.SetBounds(22, 264, 675, 156)
+$optionList.SetBounds(22, 264, 675, 196)
 foreach ($option in $optionDefinitions) {
     $checked = $SelectedOptions -eq 'all' -or ($SelectedOptions -eq 'default' -and $option.default) -or ($SelectedOptions -split ',') -contains $option.id
     [void]$optionList.Items.Add($option.label, $checked)
@@ -103,35 +103,35 @@ $retentionMinutes.Enabled = $optionList.GetItemChecked($retentionIndex)
 
 $checkButton = New-Object Windows.Forms.Button
 $checkButton.Text = '检查来源'
-$checkButton.SetBounds(22, 426, 100, 36)
+$checkButton.SetBounds(22, 466, 100, 36)
 $applyButton = New-Object Windows.Forms.Button
 $applyButton.Text = '生成副本'
-$applyButton.SetBounds(134, 426, 100, 36)
+$applyButton.SetBounds(134, 466, 100, 36)
 $applyButton.Enabled = $false
 $openButton = New-Object Windows.Forms.Button
 $openButton.Text = '打开副本目录'
-$openButton.SetBounds(378, 426, 130, 36)
+$openButton.SetBounds(378, 466, 130, 36)
 $openButton.Enabled = $false
 $restoreButton = New-Object Windows.Forms.Button
 $restoreButton.Text = '原位回滚'
-$restoreButton.SetBounds(246, 426, 120, 36)
+$restoreButton.SetBounds(246, 466, 120, 36)
 $restoreButton.Enabled = $false
 $form.Controls.AddRange(@($checkButton, $applyButton, $restoreButton, $openButton))
 
 $status = New-Object Windows.Forms.Label
 $status.Text = '请选择来源安装目录，然后检查。'
-$status.SetBounds(22, 478, 675, 27)
+$status.SetBounds(22, 518, 675, 27)
 $form.Controls.Add($status)
 $details = New-Object Windows.Forms.TextBox
 $details.Multiline = $true
 $details.ReadOnly = $true
 $details.ScrollBars = 'Vertical'
-$details.SetBounds(22, 511, 675, 171)
+$details.SetBounds(22, 551, 675, 171)
 $details.Text = "生成期间可以继续使用当前 Codex；不要同时更新来源安装。`r`n副本包含完整运行资源，另占一份安装的磁盘空间。`r`n生成后不会自动启动或替换原版入口。"
 $form.Controls.Add($details)
 $note = New-Object Windows.Forms.Label
 $note.Text = '实验工具，需要 Node.js 20+。原位升级/回滚前须完全退出 Codex。'
-$note.SetBounds(22, 708, 675, 28)
+$note.SetBounds(22, 748, 675, 28)
 $form.Controls.Add($note)
 
 $script:worker = $null
@@ -268,6 +268,8 @@ $timer.Add_Tick({
         if ($SmokeTest) {
             [Console]::WriteLine((@{ status = $result.status; itemCount = $optionList.Items.Count; checkedCount = $optionList.CheckedItems.Count; selectedOptions = $result.selectedOptions } | ConvertTo-Json -Compress))
         }
+        if ($result.launcher -and $result.status -ne 'upgrade-restored') { $details.Text += "`r`n专用启动入口：$($result.launcher)" }
+        if ($result.status -ne 'upgrade-restored' -and $result.launchArguments -contains '--disable-features=NonBlockingOsClipboardReads') { $details.Text += "`r`n已启用剪贴板兼容参数，仅通过专用入口启动时生效。" }
         $script:smokeExit = 0
     } catch {
         $status.Text = '操作未完成'

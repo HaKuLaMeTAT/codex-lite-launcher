@@ -14,5 +14,8 @@
   {"id": "app-tools-direct-node", "label": "应用工具直接启动 Node", "default": false, "edits": ["app-tools-direct-node"]},
   {"id": "app-tools-shared-host", "label": "应用工具共享通道", "default": false, "edits": ["app-tools-shared-host"]},
   {"id": "serialized-git-snapshots", "label": "同仓库 Git 快照串行调度", "default": false, "edits": ["serialized-git-snapshots"]},
-  {"id": "reduced-motion", "label": "减少界面动画（实验）", "default": false, "edits": ["reduced-motion"]}
+  {"id": "reduced-motion", "label": "减少界面动画（实验）", "default": false, "edits": ["reduced-motion"]},
+  {"id": "image-data-url-first", "label": "图片发送优先使用内存", "default": false, "edits": ["image-data-url-first-main", "image-data-url-first-renderer"]},
+  {"id": "cached-scroll-cleanup", "label": "会话清理复用滚动距离", "default": false, "edits": ["cached-scroll-cleanup"]},
+  {"id": "clipboard-compat", "label": "剪贴板兼容启动（需专用入口）", "default": false, "edits": []}
 ]
